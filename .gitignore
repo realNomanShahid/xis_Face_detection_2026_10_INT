@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# Secrets and environment variables
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Generated files
+*.logresults/output1.mp4
+results/output1.mp4

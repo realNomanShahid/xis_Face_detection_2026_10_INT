@@ -1,0 +1,5 @@
+numpy
+cupy-cuda12x
+opencv-python-headless
+nvidia-ml-py
+requests
