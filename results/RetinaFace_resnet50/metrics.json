@@ -1,0 +1,85 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5080",
+  "model": "RetinaFace-R50",
+  "det_width": 1280,
+  "det_height": 736,
+  "conf": 0.4,
+  "nms": 0.4,
+  "source": "rtsp://127.0.0.1:8554/stream",
+  "live": true,
+  "frame_size": [
+    1280,
+    720
+  ],
+  "source_fps": 0.0,
+  "frames": 16339,
+  "warmup_frames": 30,
+  "steady_fps": 346.08865722556675,
+  "whole_run_fps": 346.0601733352692,
+  "realtime_factor": 0.0,
+  "headroom": 1.4898259723415597,
+  "delivered_fps_median": 348.0,
+  "delivered_fps_min": 306,
+  "seconds_without_frames": 0,
+  "longest_gap_ms": 49.39262103289366,
+  "frames_dropped": 7,
+  "frames_received": 16346,
+  "frames_encoded": 16339,
+  "estimated_max_fps": 515.6118702674647,
+  "bottleneck": "detect (nvinfer)",
+  "latency_ms": {
+    "detect": {
+      "mean": 1.9394433248429044,
+      "p50": 1.8680650391615927,
+      "p95": 2.3151802015490826,
+      "max": 10.411749011836946,
+      "n": 16309
+    },
+    "post": {
+      "mean": 0.7723230681723835,
+      "p50": 0.7050060085020959,
+      "p95": 1.4634764054790137,
+      "max": 2.6919160154648125,
+      "n": 16309
+    },
+    "blur": {
+      "mean": 0.6381308305996871,
+      "p50": 0.21640397608280182,
+      "p95": 1.5166889992542565,
+      "max": 9.61468496825546,
+      "n": 16309
+    },
+    "encode": {
+      "mean": 0.9035363659812062,
+      "p50": 0.7343280012719333,
+      "p95": 2.0602619973942637,
+      "max": 5.913205037359148,
+      "n": 16309
+    },
+    "e2e": {
+      "mean": 23.02977284491435,
+      "p50": 22.437595995143056,
+      "p95": 28.943096986040473,
+      "max": 66.22839201008901,
+      "n": 16309
+    }
+  },
+  "frame_interval_ms": {
+    "mean": 2.889433037235427,
+    "p50": 2.5447224907111377,
+    "p95": 4.608049531816504,
+    "max": 49.39262103289366
+  },
+  "avg_faces_per_frame": 7.509945529102148,
+  "max_faces": 52,
+  "frames_zero_detections": 6059,
+  "frames_held": 836,
+  "total_detections": 122705,
+  "cpu_cores_avg": 2.0058444564745974,
+  "gpu_util_avg": 58.6063829787234,
+  "gpu_util_peak": 72,
+  "nvenc_util_avg": 7.085106382978723,
+  "nvdec_util_avg": 6.0,
+  "gpu_mem_peak_mb": 4298,
+  "output": "/home/xisai-s1/Workspace/NomanShahid/Face_detection/live_blurred.mp4"
+}

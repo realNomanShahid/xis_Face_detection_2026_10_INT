@@ -24,7 +24,7 @@ nvurisrcbin (NVDEC decode)
 | Module | Device | Notes |
 |--------|--------|-------|
 | Stream Decode (NVDEC) | **GPU** | Hardware video decode |
-| Face Detection (TensorRT / SCRFD-2.5G) | **GPU** | TensorRT engine, FP16 |
+| Face Detection (TensorRT / .Engine) | **GPU** | TensorRT engine, FP16 |
 | Post-processing (decode + NMS) | CPU | Very light (tiny tensors only) |
 | Face Blur (Custom CUDA kernels) | **GPU** | Separable box blur inside ellipse |
 | Video Encode (NVENC) | **GPU** | Hardware H.264 / H.265 encode |

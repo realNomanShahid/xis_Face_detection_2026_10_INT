@@ -1,47 +1,62 @@
 # How to Run
 
+Simple guide for SCRFD-2.5G, SCRFD-10G, and RetinaFace-R50.
+
+Before you start, install DeepStream and Python packages → see [INSTALL_DEEPSTREAM.md](INSTALL_DEEPSTREAM.md)
+
+Model details and ONNX download links → see [MODEL.md](MODEL.md)
+
 ---
 
-## 1. Prepare the TensorRT Engine
+## A. SCRFD-2.5G and SCRFD-10G
 
-You need a TensorRT engine file for SCRFD-2.5G.
+### Step 1 – Get the ONNX file
 
-If you already have the `.engine` file:
+Download from [MODEL.md](MODEL.md), or use your own:
+
+- SCRFD 2.5G → `scrfd_2.5g_bnkps_shape640x640.onnx`
+- SCRFD 10G → `scrfd_10g_bnkps.onnx`
+
+### Step 2 – Build TensorRT engine (only once)
 
 ```bash
---engine scrfd_2.5g_bnkps.onnx_b1_gpu0_fp16.engine
-```
-
-If you only have the ONNX file, the script can rebuild the engine:
-
-```bash
-python3 face_blur_deepstream.py \
+# SCRFD 2.5G
+python3 scrfd_face_detection.py \
   --source video.mp4 \
   --engine scrfd_2.5g.engine \
-  --onnx scrfd_2.5g_bnkps.onnx
+  --onnx scrfd_2.5g_bnkps_shape640x640.onnx
+
+# SCRFD 10G
+python3 scrfd_face_detection.py \
+  --source video.mp4 \
+  --engine scrfd_10g.engine \
+  --onnx scrfd_10g_bnkps.onnx
 ```
 
----
+DeepStream will create the `.engine` file automatically.
 
-## 2. Run on a Video File (fastest)
+### Step 3 – Run on a video file
 
 ```bash
-python3 face_blur_deepstream.py \
+# SCRFD 2.5G
+python3 scrfd_face_detection.py \
   --source video.mp4 \
-  --engine scrfd_2.5g_bnkps.onnx_b1_gpu0_fp16.engine \
+  --engine scrfd_2.5g.engine \
+  --output output_blurred.mp4
+
+# SCRFD 10G
+python3 scrfd_face_detection.py \
+  --source video.mp4 \
+  --engine scrfd_10g.engine \
   --output output_blurred.mp4
 ```
 
-This runs as fast as possible (hundreds of FPS).
-
----
-
-## 3. Run on RTSP / Live Stream
+### Step 4 – Run on RTSP / live stream
 
 ```bash
-python3 face_blur_deepstream.py \
+python3 scrfd_face_detection.py \
   --source rtsp://127.0.0.1:8554/stream \
-  --engine scrfd_2.5g_bnkps.onnx_b1_gpu0_fp16.engine \
+  --engine scrfd_2.5g.engine \
   --output live_blurred.mp4 \
   --max-seconds 60 \
   --width 1280 \
@@ -51,11 +66,56 @@ python3 face_blur_deepstream.py \
 
 ---
 
-## 4. High-FPS Test with Your Own RTSP Server
+## B. RetinaFace-R50
 
-To measure true maximum performance, create a local high-speed RTSP source.
+RetinaFace needs one extra step: convert the PyTorch `.pth` weights to ONNX first.
 
-### Terminal 1 – Start RTSP server
+### Step 1 – Convert .pth → ONNX
+
+```bash
+python3 pytorch_to_onnx_retinaface.py
+```
+
+This creates the ONNX file (for example `retinaface_r50.onnx`).
+
+### Step 2 – Build TensorRT engine (only once)
+
+```bash
+python3 retinaface_face_detection.py \
+  --source video.mp4 \
+  --engine retinaface_r50.engine \
+  --onnx retinaface_r50.onnx
+```
+
+### Step 3 – Run on a video file
+
+```bash
+python3 retinaface_face_detection.py \
+  --source video.mp4 \
+  --engine retinaface_r50.engine \
+  --output output_blurred.mp4
+```
+
+### Step 4 – Run on RTSP / live stream
+
+```bash
+python3 retinaface_face_detection.py \
+  --source rtsp://127.0.0.1:8554/stream \
+  --engine retinaface_r50.engine \
+  --output live_blurred.mp4 \
+  --max-seconds 60 \
+  --width 1280 \
+  --height 720 \
+  --leaky
+```
+
+---
+
+## C. High-FPS Test (optional)
+
+To measure maximum pipeline speed, use a local high-rate RTSP server.
+
+**Terminal 1 – start RTSP server**
 
 ```bash
 ffmpeg -stream_loop -1 -i video.mp4 \
@@ -63,16 +123,14 @@ ffmpeg -stream_loop -1 -i video.mp4 \
   -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/stream
 ```
 
-> **Important:** Do **not** use `-re`.  
-> `-re` forces real-time speed (~25 FPS).  
-> Without `-re`, FFmpeg pushes frames as fast as possible.
+> Do **not** use `-re`. That forces real-time (~25 FPS).
 
-### Terminal 2 – Run the pipeline
+**Terminal 2 – run pipeline** (SCRFD or RetinaFace)
 
 ```bash
-python3 face_blur_deepstream.py \
+python3 scrfd_face_detection.py \
   --source rtsp://127.0.0.1:8554/stream \
-  --engine scrfd_2.5g_bnkps.onnx_b1_gpu0_fp16.engine \
+  --engine scrfd_2.5g.engine \
   --output live_blurred.mp4 \
   --max-seconds 60 \
   --width 1280 \
@@ -80,11 +138,11 @@ python3 face_blur_deepstream.py \
   --leaky
 ```
 
-You should see ~400+ FPS.
+More detail → [HIGH_FPS_RTSP.md](HIGH_FPS_RTSP.md)
 
 ---
 
-## 5. Useful Arguments
+## Useful Arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -92,11 +150,11 @@ You should see ~400+ FPS.
 | `--engine` | – | TensorRT engine file (required) |
 | `--onnx` | – | Optional ONNX to rebuild engine |
 | `--output` | `output_blurred.mp4` | Output video |
-| `--det-size` | `640` | Model input size |
+| `--det-size` | `640` | Model input size (SCRFD) |
 | `--conf` | `0.35` | Detection confidence |
 | `--pad` | `0.20` | Face box padding |
 | `--blur-frac` | `0.25` | Blur strength |
-| `--max-seconds` | `0` | Stop after N seconds (0 = full video) |
+| `--max-seconds` | `0` | Stop after N seconds (0 = full) |
 | `--width` / `--height` | `1920` / `1080` | Streammux size |
 | `--leaky` | off | Drop old frames when slow (good for live) |
 | `--sample-every` | `100` | Save before/after images every N frames |
@@ -104,7 +162,7 @@ You should see ~400+ FPS.
 
 ---
 
-## 6. Output Files
+## Output Files
 
 | File | Description |
 |------|-------------|
@@ -114,6 +172,10 @@ You should see ~400+ FPS.
 
 ---
 
-## Next Step
+## Quick Checklist
 
-See performance → [RESULTS.md](RESULTS.md)
+1. Install DeepStream → [INSTALL_DEEPSTREAM.md](INSTALL_DEEPSTREAM.md)
+2. Download ONNX → [MODEL.md](MODEL.md)
+3. **SCRFD:** run `scrfd_face_detection.py` with `--onnx` once to build engine, then run normally
+4. **RetinaFace:** run `pytorch_to_onnx_retinaface.py` first, then `retinaface_face_detection.py`
+5. See results → [RESULTS.md](RESULTS.md)

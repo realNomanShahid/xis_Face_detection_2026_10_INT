@@ -1,0 +1,80 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5080",
+  "model": "SCRFD-2.5G",
+  "det_size": 640,
+  "conf": 0.35,
+  "nms": 0.4,
+  "source": "file:///home/xisai-s1/Workspace/NomanShahid/Face_detection/video.mp4",
+  "live": false,
+  "frame_size": [
+    1920,
+    1080
+  ],
+  "source_fps": 59.94006113766356,
+  "frames": 1800,
+  "warmup_frames": 30,
+  "steady_fps": 565.7206949449823,
+  "whole_run_fps": 565.6675608586123,
+  "realtime_factor": 9.438106738758556,
+  "headroom": 1.7638296110217269,
+  "frames_dropped": 0,
+  "frames_received": 1800,
+  "frames_encoded": 1800,
+  "estimated_max_fps": 997.834913311749,
+  "bottleneck": "encode (NVENC)",
+  "latency_ms": {
+    "detect": {
+      "mean": 0.4228891409857272,
+      "p50": 0.4035250167362392,
+      "p95": 0.5146776413312181,
+      "max": 3.354070009663701,
+      "n": 1770
+    },
+    "post": {
+      "mean": 0.6019174273580965,
+      "p50": 0.581910484470427,
+      "p95": 0.7113767176633699,
+      "max": 1.7371309804730117,
+      "n": 1770
+    },
+    "blur": {
+      "mean": 0.1403756768213806,
+      "p50": 0.1391420082654804,
+      "p95": 0.2087494300212711,
+      "max": 0.32649905188009143,
+      "n": 1770
+    },
+    "encode": {
+      "mean": 1.002169784459701,
+      "p50": 0.9581299964338541,
+      "p95": 1.2453712814021856,
+      "max": 2.3164409794844687,
+      "n": 1770
+    },
+    "e2e": {
+      "mean": 14.198700488001728,
+      "p50": 13.291969982674345,
+      "p95": 21.94266570149921,
+      "max": 33.60268898541108,
+      "n": 1770
+    }
+  },
+  "frame_interval_ms": {
+    "mean": 1.767656741101282,
+    "p50": 1.5969560481607914,
+    "p95": 2.025927242357284,
+    "max": 22.435719962231815
+  },
+  "avg_faces_per_frame": 23.77888888888889,
+  "max_faces": 35,
+  "frames_zero_detections": 0,
+  "frames_held": 0,
+  "total_detections": 42802,
+  "cpu_cores_avg": 1.7469116881087885,
+  "gpu_util_avg": 18.714285714285715,
+  "gpu_util_peak": 24,
+  "nvenc_util_avg": 21.142857142857142,
+  "nvdec_util_avg": 12.0,
+  "gpu_mem_peak_mb": 4132,
+  "output": "/home/xisai-s1/Workspace/NomanShahid/Face_detection/output_blurred.mp4"
+}
