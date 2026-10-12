@@ -41,7 +41,7 @@ Real-time face detection and blurring pipeline using **NVIDIA DeepStream**, **Te
 - **SCRFD-10G** — slightly more detections, still very fast
 - **RetinaFace-R50** — most faces detected, higher GPU use
 
-Full model details → [docs/MODEL.md](docs/MODEL.md)
+Full model details → [docs/MODEL.md](docs/md_files/MODEL.md)
 
 ---
 
@@ -94,7 +94,7 @@ Only small detector output tensors are copied to CPU for box decoding and NMS.
 | Stream Mux / Queue (DeepStream) | **GPU** | Zero-copy GPU buffers |
 
 Almost the entire pipeline runs on GPU.  
-Details → [docs/MODULES_GPU.md](docs/MODULES_GPU.md)
+Details → [docs/MODULES_GPU.md](docs/md_files/MODULES_GPU.md)
 
 ---
 
@@ -120,7 +120,7 @@ Details → [docs/MODULES_GPU.md](docs/MODULES_GPU.md)
 | Blur (CUDA) | 0.15 / 0.60 | 0.37 / 0.84 | 1.36 / 5.81 |
 | Encode (NVENC) | 1.02 / 2.43 | 1.15 / 2.04 | 2.21 / 4.68 |
 
-Full results → [docs/RESULTS.md](docs/RESULTS.md)
+Full results → [docs/RESULTS.md](docs/md_files/RESULTS.md)
 
 ---
 
@@ -128,7 +128,7 @@ Full results → [docs/RESULTS.md](docs/RESULTS.md)
 
 ### Install first
 
-See → [docs/INSTALL_DEEPSTREAM.md](docs/INSTALL_DEEPSTREAM.md)
+See → [docs/INSTALL_DEEPSTREAM.md](docs/md_files/INSTALL_DEEPSTREAM.md)
 
 ### SCRFD (2.5G or 10G)
 
@@ -178,7 +178,7 @@ python3 scrfd_face_detection.py \
   --leaky
 ```
 
-Full run guide → [docs/HOW_TO_RUN.md](docs/HOW_TO_RUN.md)
+Full run guide → [docs/HOW_TO_RUN.md](docs/md_files/HOW_TO_RUN.md)
 
 ---
 
@@ -205,7 +205,7 @@ python3 scrfd_face_detection.py \
   --leaky
 ```
 
-Details → [docs/HIGH_FPS_RTSP.md](docs/HIGH_FPS_RTSP.md)
+Details → [docs/HIGH_FPS_RTSP.md](docs/md_files/HIGH_FPS_RTSP.md)
 
 ---
 
@@ -213,12 +213,12 @@ Details → [docs/HIGH_FPS_RTSP.md](docs/HIGH_FPS_RTSP.md)
 
 | Document | Description |
 |----------|-------------|
-| [docs/INSTALL_DEEPSTREAM.md](docs/INSTALL_DEEPSTREAM.md) | Install DeepStream + Python packages |
-| [docs/HOW_TO_RUN.md](docs/HOW_TO_RUN.md) | How to run SCRFD and RetinaFace |
-| [docs/MODEL.md](docs/MODEL.md) | Model details + ONNX download links |
-| [docs/RESULTS.md](docs/RESULTS.md) | Full performance comparison |
-| [docs/MODULES_GPU.md](docs/MODULES_GPU.md) | Which modules run on GPU vs CPU |
-| [docs/HIGH_FPS_RTSP.md](docs/HIGH_FPS_RTSP.md) | High-rate RTSP testing method |
+| [docs/INSTALL_DEEPSTREAM.md](docs/md_files/INSTALL_DEEPSTREAM.md) | Install DeepStream + Python packages |
+| [docs/HOW_TO_RUN.md](docs/md_files/HOW_TO_RUN.md) | How to run SCRFD and RetinaFace |
+| [docs/MODEL.md](docs/md_files/MODEL.md) | Model details + ONNX download links |
+| [docs/RESULTS.md](docs/md_files/RESULTS.md) | Full performance comparison |
+| [docs/MODULES_GPU.md](docs/md_files/MODULES_GPU.md) | Which modules run on GPU vs CPU |
+| [docs/HIGH_FPS_RTSP.md](docs/md_files/HIGH_FPS_RTSP.md) | High-rate RTSP testing method |
 
 ---
 
