@@ -6,7 +6,6 @@ face_blur_deepstream_retinaface.py
 Face detection (RetinaFace ResNet-50, ONNX -> TensorRT) + GPU face blur for live
 streams or video files, using NVIDIA DeepStream for decode, batching, inference and encode.
 
-
 Setup (once)
 ------------
   * x86 Linux + NVIDIA GPU + DeepStream 7.x or 8.x with the Python bindings (pyds).
@@ -40,6 +39,8 @@ Output files
   The two .jsonl logs are written next to metrics.json (or in --log-dir). --no-logs turns them off.
   sample_frames/          ONLY created when you ask for it: --save-samples (every 100 frames)
                           or --sample-every N. Without these flags nothing is stored.
+  detected_instances/     EVERY frame where a face was detected and blurred .
+                          On by default; disable with --no-save-detections.
 
 Press Ctrl+C at any time: the script finalises the video file and prints the report.
 """
@@ -574,6 +575,7 @@ class App:
         self.frame_idx = 0
         self.held = 0
         self.raw_counts = []
+        self.n_saved_detections = 0
         self.frame_times = []
         self.pts = []
         self.last_boxes, self.miss = np.zeros((0, 5), np.float32), 0
@@ -952,8 +954,11 @@ class App:
         rois = make_rois(boxes, W, H, a.pad, a.blur_frac)
         t1 = time.perf_counter()
 
+        # Periodic samples AND/OR every frame where a face was detected and blurred
         sample = a.sample_every > 0 and idx % a.sample_every == 0
-        orig = cp.asnumpy(frame[:, :, :3]) if sample else None
+        save_det = (not a.no_save_detections) and raw > 0 and len(rois) > 0
+        need_cpu = sample or save_det
+        orig = cp.asnumpy(frame[:, :, :3]) if need_cpu else None
 
         t2 = time.perf_counter()
         blur_err = None
@@ -969,14 +974,22 @@ class App:
         if blur_err is not None:
             raise blur_err
 
-        if sample:
+        if need_cpu:
             after = cp.asnumpy(frame[:, :, :3])
             side = np.ascontiguousarray(np.hstack([orig, after])[:, :, ::-1])   # RGB -> BGR
             sc = 1800.0 / side.shape[1]
             if sc < 1.0:
                 side = cv2.resize(side, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
-            cv2.imwrite(os.path.join(a.sample_dir, f"frame_{idx:06d}.jpg"), side,
-                        [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if sample:
+                cv2.imwrite(os.path.join(a.sample_dir, f"frame_{idx:06d}.jpg"), side,
+                            [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if save_det:
+                # only the blurred frame (not side-by-side)
+                 blurred = np.ascontiguousarray(after[:, :, ::-1])   # RGB -> BGR
+                 name = f"det_{idx:06d}_faces{raw}.jpg"
+                 cv2.imwrite(os.path.join(a.detected_dir, name), blurred,
+                     [cv2.IMWRITE_JPEG_QUALITY, 85])
+                 self.n_saved_detections += 1
 
         # --- current FPS (average over the last 2 seconds) + live preview window ----------
         tn = time.perf_counter()
@@ -1271,6 +1284,9 @@ class App:
         print(f" Output video   : {os.path.abspath(a.output)}")
         if a.sample_every > 0:
             print(f" Sample frames  : {os.path.abspath(a.sample_dir)}  (left original, right blurred)")
+        if not a.no_save_detections:
+            print(f" Detected frames: {os.path.abspath(a.detected_dir)}  "
+                  f"({self.n_saved_detections} images, left original / right blurred)")
         print(f" Metrics JSON   : {os.path.abspath(a.metrics_json)}")
         if self.det_log_path:
             print(f" Detection log  : {os.path.abspath(self.det_log_path)}")
@@ -1298,7 +1314,9 @@ class App:
             privacy_audit_summary=asum,
             detection_log=os.path.abspath(self.det_log_path) if self.det_log_path else None,
             privacy_audit_log=os.path.abspath(self.aud_log_path) if self.aud_log_path else None,
-            sample_dir=os.path.abspath(a.sample_dir) if a.sample_every > 0 else None)
+            sample_dir=os.path.abspath(a.sample_dir) if a.sample_every > 0 else None,
+            detected_dir=os.path.abspath(a.detected_dir) if not a.no_save_detections else None,
+            n_saved_detections=self.n_saved_detections)
         with open(a.metrics_json, "w") as f:
             json.dump(report, f, indent=2, default=float)
         return 0
@@ -1355,6 +1373,10 @@ def parse_args():
                         "Without --save-samples / --sample-every nothing is stored.")
     p.add_argument("--sample-every", type=int, default=0,
                    help="save a before/after image every N frames (0 = off)")
+    p.add_argument("--detected-dir", default="detected_instances",
+                   help="folder (under --out-dir) for every frame where a face was detected and blurred")
+    p.add_argument("--no-save-detections", action="store_true",
+                   help="do not save per-detection images into detected_instances/")
     p.add_argument("--log-dir", default="",
                    help="folder for detection_logs.jsonl and privacy_audit.jsonl (default: next to --metrics-json)")
     p.add_argument("--no-logs", action="store_true", help="do not write the two .jsonl log files")
@@ -1400,11 +1422,14 @@ def parse_args():
     a.output = _in_dir(a.output)
     a.metrics_json = _in_dir(a.metrics_json)
     a.sample_dir = _in_dir(a.sample_dir)
+    a.detected_dir = _in_dir(a.detected_dir)
     a.log_dir = a.log_dir or a.out_dir
     if a.save_samples and a.sample_every <= 0:
         a.sample_every = 100
     if a.sample_every > 0:
         os.makedirs(a.sample_dir, exist_ok=True)
+    if not a.no_save_detections:
+        os.makedirs(a.detected_dir, exist_ok=True)
     return a
 
 
