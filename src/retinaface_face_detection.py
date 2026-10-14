@@ -3,16 +3,9 @@
 """
 face_blur_deepstream_retinaface.py
 ==================================
-Face detection (RetinaFace ResNet-50) + GPU face blur for live
+Face detection (RetinaFace ResNet-50, ONNX -> TensorRT) + GPU face blur for live
 streams or video files, using NVIDIA DeepStream for decode, batching, inference and encode.
 
-
-  nvurisrcbin (NVDEC decode, RTSP/HLS/file, auto-reconnect)
-    -> nvstreammux -> queue
-    -> nvinfer (TensorRT engine, resize + normalise + inference on GPU)
-    -> queue -> nvvideoconvert (to RGBA, on GPU)
-    -> [python probe: decode RetinaFace outputs (tiny, CPU) + CUDA blur kernels (GPU)]
-    -> queue -> nvvideoconvert (to NV12) -> NVENC encoder -> parser -> mp4 file
 
 Setup (once)
 ------------
@@ -22,19 +15,33 @@ Setup (once)
 
 Run examples
 ------------
-  # video file (nvinfer builds the TensorRT engine from the ONNX on first run, then reuses it)
-  python3 face_blur_deepstream_retinaface.py --source clip.mp4 \
-          --onnx retinaface_r50_1280x736.onnx --conf 0.4
+  # real IP camera (RTSP over TCP) with the live window
+  python3 face_blur_deepstream_retinaface.py --source rtsp://user:pass@192.168.1.20:554/stream1 \
+          --onnx retinaface_r50_1280x736.onnx --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine \
+          --width 1280 --height 720 --conf 0.4 --preview
 
-  # live stream, 60 seconds
-  python3 face_blur_deepstream_retinaface.py --source rtsp://127.0.0.1:8554/cam \
-          --onnx retinaface_r50_640x640.onnx --max-seconds 60 --width 1280 --height 720
-
-  # Rutube page link
+  # Rutube page link with the live window
   python3 face_blur_deepstream_retinaface.py --rutube-page https://rutube.ru/live/video/<id>/ \
-          --onnx retinaface_r50_640x640.onnx --max-seconds 60
+          --onnx retinaface_r50_1280x736.onnx --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine \
+          --width 1280 --height 720 --max-height 720 --conf 0.4 --out-fps 13 --preview --max-seconds 60
 
-Press Ctrl+C at any time: the script finalises the mp4 and prints the report.
+  # video file
+  python3 face_blur_deepstream_retinaface.py --source clip.mp4 \
+          --onnx retinaface_r50_1280x736.onnx --conf 0.4 --preview
+
+Output files
+------------
+  output_blurred.mkv      the blurred video (use --output name.mp4 for MP4)
+  metrics.json            performance report (+ a privacy-audit summary)
+  detection_logs.jsonl    one line per frame: frame index, detection count, confidence
+                          summary (min/mean/max), timing
+  privacy_audit.jsonl     one line per frame: blur operation status, detected face count,
+                          output safety status
+  The two .jsonl logs are written next to metrics.json (or in --log-dir). --no-logs turns them off.
+  sample_frames/          ONLY created when you ask for it: --save-samples (every 100 frames)
+                          or --sample-every N. Without these flags nothing is stored.
+
+Press Ctrl+C at any time: the script finalises the video file and prints the report.
 """
 import argparse
 import ctypes
@@ -47,7 +54,8 @@ import tempfile
 import threading
 import time
 import traceback
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from datetime import datetime
 
 import numpy as np
 
@@ -65,7 +73,6 @@ except ImportError as _e:  # pragma: no cover
 
 # ----------------------------------------------------------------------------------
 # CUDA kernels: separable box blur inside an ellipse, all faces of a frame in 2 launches
-# (UNCHANGED)
 # ----------------------------------------------------------------------------------
 CUDA_SRC = r"""
 extern "C" {
@@ -129,7 +136,7 @@ __global__ void blur_v(unsigned char* frame, const unsigned char* tmp,
 
 
 # ----------------------------------------------------------------------------------
-# small helpers (UNCHANGED except guess_model_name)
+# small helpers
 # ----------------------------------------------------------------------------------
 def setp(el, name, value):
     """set_property that never kills the script if a property differs between versions."""
@@ -152,7 +159,6 @@ def to_uri(src):
 
 def resolve_rutube(page_url, max_h):
     """Rutube page link -> HLS (.m3u8) link, choosing the best quality up to max_h."""
-    import re
     from urllib.parse import urljoin
 
     import requests
@@ -208,7 +214,6 @@ def resolve_rutube(page_url, max_h):
 
 def guess_model_name(*paths):
     """'retinaface_r50_640x640.onnx' -> 'RetinaFace-R50'"""
-    import re
     for pth in paths:
         base = os.path.basename(pth or "").lower()
         m = re.search(r"retinaface[_-]?(r50|r18|mnet|mobile\w*|resnet\d+)?", base)
@@ -236,9 +241,9 @@ def nms_np(boxes, scores, thr):
 
 
 # ----------------------------------------------------------------------------------
-# RetinaFace output decoding (numpy, tiny: 16800 priors at 640x640)   <-- NEW
+# RetinaFace output decoding (numpy, tiny)
 #
-# Model outputs (biubug6 / Pytorch_Retinaface style export), each with N = 16800 rows:
+# Model outputs (biubug6 / Pytorch_Retinaface style export), each with N rows:
 #     loc     (N, 4)   box regression  (dcx, dcy, dw, dh)
 #     conf    (N, 2)   [background, face]  (logits or already softmaxed)
 #     landms  (N, 10)  5 landmarks (not needed for blurring, ignored)
@@ -349,7 +354,7 @@ def make_rois(boxes, W, H, pad, blur_frac):
 
 
 # ----------------------------------------------------------------------------------
-# metrics helpers (UNCHANGED)
+# metrics helpers
 # ----------------------------------------------------------------------------------
 class Stat:
     """Collects timings (seconds), skips the first `warm` samples, reports ms."""
@@ -411,15 +416,144 @@ class GpuMonitor(threading.Thread):
 
 
 # ----------------------------------------------------------------------------------
+# live preview window (a second, tiny GStreamer pipeline: appsrc -> videoconvert -> X window)
+# It is fed from the probe, throttled, and can never block or crash the main pipeline.
+# ----------------------------------------------------------------------------------
+class Preview:
+    def __init__(self, max_w, max_h, max_fps, draw_boxes):
+        self.max_w, self.max_h = int(max_w), int(max_h)
+        self.min_gap = 1.0 / max(float(max_fps), 1.0)
+        self.draw_boxes = draw_boxes
+        self.ok = True                  # False = preview switched off (window closed / error)
+        self.pipe = None
+        self.appsrc = None
+        self.pw = self.ph = 0
+        self.sx = self.sy = 1.0
+        self.last = 0.0
+
+    def due(self, now):
+        if not self.ok or now - self.last < self.min_gap:
+            return False
+        self.last = now
+        return True
+
+    def _start(self, W, H):
+        sc = min(self.max_w / float(W), self.max_h / float(H), 1.0)   # fit inside, never upscale
+        self.pw = max(2, (int(W * sc) // 2) * 2)
+        self.ph = max(2, (int(H * sc) // 2) * 2)
+        self.sx, self.sy = self.pw / float(W), self.ph / float(H)
+
+        pipe = Gst.Pipeline.new("preview")
+        src = Gst.ElementFactory.make("appsrc", "psrc")
+        conv = Gst.ElementFactory.make("videoconvert", "pconv")
+        sink = None
+        for name in ("ximagesink", "xvimagesink", "autovideosink"):
+            sink = Gst.ElementFactory.make(name, "psink")
+            if sink:
+                break
+        if not (src and conv and sink):
+            raise RuntimeError("GStreamer display elements are missing "
+                               "(Ubuntu: sudo apt install gstreamer1.0-x gstreamer1.0-plugins-base)")
+        setp(src, "caps", Gst.Caps.from_string(
+            f"video/x-raw,format=BGR,width={self.pw},height={self.ph},framerate=0/1"))
+        setp(src, "format", Gst.Format.TIME)
+        setp(src, "is-live", True)
+        setp(src, "do-timestamp", True)
+        setp(src, "block", False)
+        setp(src, "max-bytes", self.pw * self.ph * 3 * 4)
+        setp(sink, "sync", False)                    # show frames immediately
+        for el in (src, conv, sink):
+            pipe.add(el)
+        if not src.link(conv) or not conv.link(sink):
+            raise RuntimeError("could not link the preview pipeline")
+        bus = pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_msg)
+        if pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("could not open the preview window (is a desktop session running?)")
+        self.pipe, self.appsrc = pipe, src
+        print(f"Live preview window: {self.pw}x{self.ph} (max {self.max_w}x{self.max_h})")
+
+    def _on_msg(self, bus, msg):
+        if msg.type in (Gst.MessageType.ERROR, Gst.MessageType.EOS):
+            if msg.type == Gst.MessageType.ERROR:
+                err, _dbg = msg.parse_error()
+                print(f"[preview] window closed or display error ({err.message}); "
+                      f"the pipeline keeps running without the preview.")
+            else:
+                print("[preview] window closed; the pipeline keeps running without the preview.")
+            self.ok = False
+            GLib.idle_add(self.close)
+        return True
+
+    def show(self, rgb, det, persons, fps):
+        """rgb: HxWx3 uint8 (blurred frame). det: Nx5 detections of the CURRENT frame."""
+        H, W = int(rgb.shape[0]), int(rgb.shape[1])
+        if self.appsrc is None:
+            self._start(W, H)
+        small = rgb if (self.pw, self.ph) == (W, H) else cv2.resize(
+            rgb, (self.pw, self.ph), interpolation=cv2.INTER_AREA)
+        img = np.ascontiguousarray(small[:, :, ::-1])                 # RGB -> BGR
+        if self.draw_boxes and len(det):
+            for x1, y1, x2, y2, _s in det:
+                cv2.rectangle(img, (int(x1 * self.sx), int(y1 * self.sy)),
+                              (int(x2 * self.sx), int(y2 * self.sy)), (0, 255, 0), 1)
+        # small overlay, top-left corner
+        bw, bh = min(130, self.pw), min(40, self.ph)
+        img[0:bh, 0:bw] = img[0:bh, 0:bw] // 3                        # darken the corner
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        #cv2.putText(img, f"Persons: {persons}", (6, 16), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, f"FPS: {fps:.1f}", (6, 34), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        self.appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(img.tobytes()))
+
+    def disable(self):
+        self.ok = False
+        self.close()
+
+    def close(self):
+        self.ok = False
+        pipe, self.pipe = self.pipe, None
+        if pipe is not None:
+            try:
+                pipe.set_state(Gst.State.NULL)
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+
+# ----------------------------------------------------------------------------------
 # the application
 # ----------------------------------------------------------------------------------
 class App:
     def __init__(self, a):
         self.a = a
         self.uri = to_uri(a.source)
-        self.live = self.uri.split("://")[0].lower() in ("rtsp", "http", "https")
+        scheme = self.uri.split("://")[0].lower()
+        self.live = scheme in ("rtsp", "http", "https")
+        self.is_rtsp = scheme == "rtsp"
+        self.is_hls = scheme in ("http", "https")
         self.dec = RetinaFaceDecoder(a.det_width, a.det_height, a.conf, a.nms)
         self.plan = None
+
+        # steady output timestamps: on by default for HLS / http(s) (bursty), off for RTSP and files,
+        # unless the user gives --out-fps explicitly. --no-retime always turns it off.
+        self.do_retime = (not a.no_retime) and (self.is_hls or a.out_fps > 0)
+        self.nominal_fps = None          # frame rate announced by the stream (if any)
+        self.retime_dur = None           # ns per output frame, decided at the first frame
+        self.out_base = None
+        self.out_n = 0
+        self.retime_failed = False
+
+        # live preview window (optional)
+        self.preview = None
+        self.fps_ts = deque()            # arrival times of the last ~2 s (for the FPS shown)
+        self.cur_fps = 0.0
+        if a.preview:
+            if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+                print("[note] --preview needs a desktop session (no DISPLAY found). "
+                      "Preview is OFF; the pipeline runs normally.")
+            else:
+                self.preview = Preview(a.preview_w, a.preview_h, a.preview_fps, not a.no_preview_boxes)
 
         # compile + warm the CUDA kernels now, so the first video frame is not slow
         mod = cp.RawModule(code=CUDA_SRC)
@@ -455,6 +589,12 @@ class App:
         self.pipeline = None
         self.loop = None
         self.mon = GpuMonitor(a.gpu, lambda: self.frame_idx >= self.a.warmup)
+        # logs / audit
+        self.det_dt = OrderedDict()                   # pts -> nvinfer time of that frame (s)
+        self.f_det = self.f_aud = None
+        self.det_log_path = self.aud_log_path = None
+        self.audit = OrderedDict((k, 0) for k in (
+            "applied", "applied_from_previous_frame", "partial", "skipped_no_faces", "failed"))
 
     # -------------------------------------------------------------- pipeline
     def write_nvinfer_config(self):
@@ -510,6 +650,14 @@ class App:
             setp(src, "rtsp-reconnect-attempts", -1)
         else:
             setp(src, "file-loop", False)
+        if self.is_rtsp:
+            # TCP + jitter buffer: no lost packets, so no smeared / corrupted frames
+            if a.rtsp_protocol == "tcp":
+                setp(src, "select-rtp-protocol", 4)          # 4 = TCP only
+            setp(src, "latency", int(a.latency))
+            setp(src, "udp-buffer-size", 16 * 1024 * 1024)
+            setp(src, "drop-on-latency", False)
+            setp(src, "num-extra-surfaces", 10)
 
         mux = mk("nvstreammux", "mux")
         setp(mux, "batch-size", 1)
@@ -540,11 +688,24 @@ class App:
         enc = mk("nvv4l2h264enc" if a.codec == "h264" else "nvv4l2h265enc", "enc")
         setp(enc, "bitrate", a.bitrate)
         setp(enc, "iframeinterval", 30)
+        setp(enc, "idrinterval", 30)
         setp(enc, "gpu-id", a.gpu)
+        if a.codec == "h264":
+            setp(enc, "insert-sps-pps", 1)   # helps players start and seek correctly
         parse = mk("h264parse" if a.codec == "h264" else "h265parse", "parse")
-        mux_out = mk("qtmux", "mp4mux")
-        if self.live:
-            setp(mux_out, "fragment-duration", 2000)
+        setp(parse, "config-interval", -1)
+
+        # Container from output extension. MKV is much more reliable for live/HLS saves.
+        # Fragmented MP4 (fragment-duration) often only plays in VLC and can look corrupted.
+        out_ext = os.path.splitext(a.output)[1].lower()
+        if out_ext in (".mkv", ".webm"):
+            mux_out = mk("matroskamux", "mkvmux")
+            print(f"  [mux] using matroskamux for {a.output}")
+        else:
+            mux_out = mk("qtmux", "mp4mux")
+            # Do NOT set fragment-duration - it breaks Windows Media Player and many teammates' players
+            print(f"  [mux] using qtmux (progressive MP4) for {a.output}")
+
         sink = mk("filesink", "sink")
         setp(sink, "location", a.output)
         setp(sink, "sync", False)
@@ -560,6 +721,14 @@ class App:
             name = caps.get_structure(0).get_name() if caps and caps.get_size() else ""
             if not (name.startswith("video") or pad.get_name().startswith("vsrc")):
                 return
+            # remember the frame rate the stream announces (used for steady output timestamps)
+            try:
+                if caps and caps.get_size():
+                    ok, num, den = caps.get_structure(0).get_fraction("framerate")
+                    if ok and num > 0 and den > 0 and 1.0 <= num / den <= 120.0:
+                        self.nominal_fps = num / den
+            except Exception:  # noqa: BLE001
+                pass
             req = getattr(mux, "request_pad_simple", None) or mux.get_request_pad
             sinkpad = req("sink_0")
             self.mux_sink_pad = sinkpad
@@ -575,6 +744,8 @@ class App:
         pgie.get_static_pad("sink").add_probe(P, self.p_det_in, None)
         pgie.get_static_pad("src").add_probe(P, self.p_det_out, None)
         caps1.get_static_pad("src").add_probe(P, self.p_main, None)
+        if self.do_retime:
+            caps2.get_static_pad("src").add_probe(P, self.p_retime, None)   # runs before enc sink probe
         enc.get_static_pad("sink").add_probe(P, self.p_enc_in, None)
         parse.get_static_pad("src").add_probe(P, self.p_enc_out, None)
 
@@ -613,6 +784,38 @@ class App:
             dt = self._lap(self.t_det_in, buf)
             if dt is not None:
                 self.st["detect"].add(dt)
+                self.det_dt[buf.pts] = dt
+                if len(self.det_dt) > 400:
+                    self.det_dt.popitem(last=False)
+        return Gst.PadProbeReturn.OK
+
+    def p_retime(self, pad, info, _):
+        """Give every saved frame a steady timestamp (fixed step) so the video plays smoothly,
+        even when the source (HLS) delivers frames in bursts with long gaps."""
+        buf = info.get_buffer()
+        if buf is None or self.retime_failed:
+            return Gst.PadProbeReturn.OK
+        try:
+            if self.retime_dur is None:
+                fps = self.a.out_fps if self.a.out_fps > 0 else (self.nominal_fps or 25.0)
+                self.retime_dur = int(round(1e9 / fps))
+                src_txt = ("--out-fps" if self.a.out_fps > 0
+                           else ("stream frame rate" if self.nominal_fps else "default"))
+                print(f"Steady output timestamps: {fps:.2f} fps ({src_txt})")
+            old = int(buf.pts)
+            if self.out_base is None:
+                self.out_base = 0 if old == int(Gst.CLOCK_TIME_NONE) else old
+            new = self.out_base + self.out_n * self.retime_dur
+            self.out_n += 1
+            t0 = self.t_mux.pop(old, None)        # keep the end-to-end latency statistics working
+            buf.pts = new
+            buf.duration = self.retime_dur
+            if t0 is not None:
+                self.t_mux[new] = t0
+        except Exception:  # noqa: BLE001
+            self.retime_failed = True
+            print("\n[warn] steady-timestamp probe failed, saving original timestamps instead:\n"
+                  + traceback.format_exc())
         return Gst.PadProbeReturn.OK
 
     def p_enc_in(self, pad, info, _):
@@ -734,16 +937,18 @@ class App:
             if a.max_seconds > 0:
                 GLib.timeout_add_seconds(int(a.max_seconds), self._timer_stop)
 
-        boxes = self.dec.decode(self.plan, outs, W, H)
-        raw = len(boxes)
+        det = self.dec.decode(self.plan, outs, W, H)
+        raw = len(det)
         self.raw_counts.append(raw)
+        boxes, held_used = det, False
         if raw:
-            self.last_boxes, self.miss = boxes, 0
+            self.last_boxes, self.miss = det, 0
         else:
             self.miss += 1
             if self.miss <= a.hold and len(self.last_boxes):
                 boxes = self.last_boxes
                 self.held += 1
+                held_used = True
         rois = make_rois(boxes, W, H, a.pad, a.blur_frac)
         t1 = time.perf_counter()
 
@@ -751,10 +956,18 @@ class App:
         orig = cp.asnumpy(frame[:, :, :3]) if sample else None
 
         t2 = time.perf_counter()
-        if len(rois):
-            self._blur(frame, rois, W, H)
-        cp.cuda.Stream.null.synchronize()
+        blur_err = None
+        try:
+            if len(rois):
+                self._blur(frame, rois, W, H)
+            cp.cuda.Stream.null.synchronize()                  # blurred pixels are final from here
+        except Exception as e:  # noqa: BLE001
+            blur_err = e
         t3 = time.perf_counter()
+
+        self._log_frame(buf, idx, raw, det, held_used, len(rois), t1 - t0, t3 - t2, blur_err)
+        if blur_err is not None:
+            raise blur_err
 
         if sample:
             after = cp.asnumpy(frame[:, :, :3])
@@ -765,6 +978,22 @@ class App:
             cv2.imwrite(os.path.join(a.sample_dir, f"frame_{idx:06d}.jpg"), side,
                         [cv2.IMWRITE_JPEG_QUALITY, 85])
 
+        # --- current FPS (average over the last 2 seconds) + live preview window ----------
+        tn = time.perf_counter()
+        self.fps_ts.append(tn)
+        while tn - self.fps_ts[0] > 2.0:
+            self.fps_ts.popleft()
+        if len(self.fps_ts) > 1 and tn > self.fps_ts[0]:
+            self.cur_fps = (len(self.fps_ts) - 1) / (tn - self.fps_ts[0])
+        pv = self.preview
+        if pv is not None and pv.ok and pv.due(tn):
+            try:
+                pv.show(cp.asnumpy(frame[:, :, :3]), det, raw, self.cur_fps)
+            except Exception:  # noqa: BLE001  (the preview must never stop the real work)
+                print("\n[warn] live preview stopped because of an error (the run continues):\n"
+                      + traceback.format_exc())
+                pv.disable()
+
         self.st["post"].add(t1 - t0)
         self.st["blur"].add(t3 - t2)
         if len(self.pts) < 300:
@@ -772,7 +1001,7 @@ class App:
         now = time.perf_counter()
         if self.first_frame_wall is None:
             self.first_frame_wall = now
-        if not self.stopping:
+        if not self.stopping:                                   # shutdown frames do not count
             self.last_frame_wall = now
             self.last_cpu = time.process_time()
             self.active_frames += 1
@@ -785,6 +1014,90 @@ class App:
             el = now - self.first_frame_wall
             print(f"  {self.frame_idx} frames | {el:.0f}s | {self.frame_idx / max(el, 1e-9):.1f} fps "
                   f"| faces now: {raw}")
+
+    # -------------------------------------------------------------- logs / privacy audit
+    def open_logs(self):
+        a = self.a
+        self.f_det = self.f_aud = None
+        if a.no_logs:
+            return
+        d = a.log_dir or os.path.dirname(os.path.abspath(a.metrics_json))
+        os.makedirs(d, exist_ok=True)
+        self.det_log_path = os.path.join(d, "detection_logs.jsonl")
+        self.aud_log_path = os.path.join(d, "privacy_audit.jsonl")
+        self.f_det = open(self.det_log_path, "w", encoding="utf-8")
+        self.f_aud = open(self.aud_log_path, "w", encoding="utf-8")
+
+    def close_logs(self):
+        for f in (self.f_det, self.f_aud):
+            if f is not None:
+                try:
+                    f.flush()
+                    f.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self.f_det = self.f_aud = None
+
+    def _log_frame(self, buf, idx, raw, det, held_used, n_blur, post_s, blur_s, err):
+        """One line in detection_logs.jsonl and one in privacy_audit.jsonl for this frame."""
+        # --- blur status + output safety status ---------------------------------------
+        if err is not None:
+            status, safety = "failed", "FAIL"
+        elif raw > 0:
+            status, safety = ("applied", "PASS") if n_blur >= raw else ("partial", "WARN")
+        elif held_used and n_blur > 0:
+            status, safety = "applied_from_previous_frame", "PASS_HELD"
+        else:
+            status, safety = "skipped_no_faces", "NO_FACES_DETECTED"
+        self.audit[status] += 1
+        if self.f_det is None:
+            return
+
+        pts = int(buf.pts)
+        ts = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        det_s = self.det_dt.pop(buf.pts, None)
+        conf = None
+        if raw:
+            s = det[:, 4]
+            conf = {"min": round(float(s.min()), 4), "mean": round(float(s.mean()), 4),
+                    "max": round(float(s.max()), 4)}
+        rec = {
+            "frame": idx, "pts_ns": pts, "ts": ts,
+            "detections": raw, "confidence": conf, "held_boxes_used": held_used,
+            "timing_ms": {
+                "detect": None if det_s is None else round(det_s * 1000.0, 3),
+                "decode": round(post_s * 1000.0, 3),
+                "blur": round(blur_s * 1000.0, 3),
+                "probe_total": round((post_s + blur_s) * 1000.0, 3)},
+        }
+        self.f_det.write(json.dumps(rec) + "\n")
+
+        aud = {
+            "frame": idx, "pts_ns": pts, "ts": ts,
+            "blur_status": status,
+            "faces_detected": raw,
+            "faces_blurred": int(n_blur),
+            "blur_source": ("current_frame" if raw else ("previous_frame" if held_used else "none")),
+            "output_safety": safety,
+        }
+        if err is not None:
+            aud["error"] = f"{type(err).__name__}: {str(err)[:200]}"
+        self.f_aud.write(json.dumps(aud) + "\n")
+        if idx % 200 == 0:
+            self.f_det.flush()
+            self.f_aud.flush()
+
+    def audit_summary(self):
+        c = dict(self.audit)
+        if c["failed"]:
+            overall = "FAIL"
+        elif c["partial"]:
+            overall = "WARN"
+        else:
+            overall = "PASS"
+        return {"frames": int(sum(c.values())), "by_status": c, "overall": overall,
+                "note": "PASS = every detected face was blurred. It cannot prove that no face "
+                        "was missed by the detector."}
 
     # -------------------------------------------------------------- control
     def _timer_stop(self):
@@ -799,7 +1112,7 @@ class App:
         if self.stopping:
             return
         self.stopping = True
-        print("\nStopping: sending EOS so the mp4 is finalised ...")
+        print("\nStopping: sending EOS so the video file is finalised ...")
         if self.live and self.src is not None:
             setp(self.src, "rtsp-reconnect-interval", 0)
         if self.mux_sink_pad is not None:
@@ -809,7 +1122,7 @@ class App:
         GLib.timeout_add_seconds(15, self._force_quit)
 
     def _force_quit(self):
-        print("[warn] EOS did not finish in 15 s, quitting anyway (the mp4 may be incomplete).")
+        print("[warn] EOS did not finish in 15 s, quitting anyway (the video file may be incomplete).")
         self.loop.quit()
         return False
 
@@ -829,6 +1142,7 @@ class App:
 
     def run(self):
         self.build()
+        self.open_logs()
         self.loop = GLib.MainLoop()
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._sigint)
         self.mon.start()
@@ -841,12 +1155,15 @@ class App:
             self.loop.run()
         finally:
             self.pipeline.set_state(Gst.State.NULL)
+            if self.preview is not None:
+                self.preview.close()
             self.mon.stop()
+            self.close_logs()
         self.wall_total = time.perf_counter() - run_start
         self.cpu_total = time.process_time() - cpu_start
         return self.report()
 
-    # -------------------------------------------------------------- report (UNCHANGED)
+    # -------------------------------------------------------------- report
     def report(self):
         a = self.a
         n = self.frame_idx
@@ -898,6 +1215,11 @@ class App:
         else:
             print(f" Source                     : {self.frame_size[0]}x{self.frame_size[1]} at nvinfer, "
                   f"~{src_fps:.1f} fps (file)")
+        if self.do_retime and self.retime_dur:
+            print(f" Saved video timing         : steady {1e9 / self.retime_dur:.2f} fps "
+                  f"(smooth playback){' [FAILED, original timestamps]' if self.retime_failed else ''}")
+        else:
+            print(f" Saved video timing         : original timestamps")
         print(f" Frames processed           : {n}  (first {a.warmup} excluded from timings)")
         print(f" Total run time             : {self.wall_total:.1f} s")
         print("-" * 64)
@@ -950,6 +1272,11 @@ class App:
         if a.sample_every > 0:
             print(f" Sample frames  : {os.path.abspath(a.sample_dir)}  (left original, right blurred)")
         print(f" Metrics JSON   : {os.path.abspath(a.metrics_json)}")
+        if self.det_log_path:
+            print(f" Detection log  : {os.path.abspath(self.det_log_path)}")
+            print(f" Privacy audit  : {os.path.abspath(self.aud_log_path)}")
+        asum = self.audit_summary()
+        print(f" Privacy audit result: {asum['overall']}  {asum['by_status']}")
 
         report = dict(
             gpu=m.name, model=a.model_name, det_width=a.det_width, det_height=a.det_height, conf=a.conf, nms=a.nms,
@@ -966,7 +1293,12 @@ class App:
             total_detections=int(raw.sum()), cpu_cores_avg=cpu_cores,
             gpu_util_avg=avg(m.util), gpu_util_peak=max(m.util or [0]),
             nvenc_util_avg=avg(m.enc), nvdec_util_avg=avg(m.dec),
-            gpu_mem_peak_mb=max(m.mem or [0]), output=os.path.abspath(a.output))
+            gpu_mem_peak_mb=max(m.mem or [0]), output=os.path.abspath(a.output),
+            output_fps=(1e9 / self.retime_dur) if (self.do_retime and self.retime_dur) else None,
+            privacy_audit_summary=asum,
+            detection_log=os.path.abspath(self.det_log_path) if self.det_log_path else None,
+            privacy_audit_log=os.path.abspath(self.aud_log_path) if self.aud_log_path else None,
+            sample_dir=os.path.abspath(a.sample_dir) if a.sample_every > 0 else None)
         with open(a.metrics_json, "w") as f:
             json.dump(report, f, indent=2, default=float)
         return 0
@@ -993,18 +1325,48 @@ def parse_args():
     p.add_argument("--blur-frac", type=float, default=0.25,
                    help="blur radius as a fraction of the face size (bigger = stronger)")
     p.add_argument("--hold", type=int, default=5, help="keep last boxes this many frames if a face is missed")
-    p.add_argument("--output", default="output_blurred.mp4")
+    p.add_argument("--output", default="output_blurred.mkv")
+    p.add_argument("--out-dir", default="logs",
+                   help="folder where the video, logs, metrics and sample frames are saved")
     p.add_argument("--codec", choices=["h264", "h265"], default="h264")
     p.add_argument("--bitrate", type=int, default=8_000_000)
+    p.add_argument("--preview", action="store_true",
+                   help="open a small live window with the blurred video and a top-left overlay "
+                        "(Persons = faces in the current frame, FPS). Needs a desktop session.")
+    p.add_argument("--preview-size", default="1000x1000",
+                   help="maximum preview window size WIDTHxHEIGHT; the video keeps its shape and fits inside")
+    p.add_argument("--preview-fps", type=float, default=15,
+                   help="how many frames per second the preview window shows (does not affect the saved video)")
+    p.add_argument("--no-preview-boxes", action="store_true",
+                   help="do not draw the green detection boxes in the preview window")
+    p.add_argument("--out-fps", type=float, default=0,
+                   help="fixed frame rate of the saved video (steady timestamps). 0 = automatic: used for "
+                        "HLS / http(s) sources only, taken from the stream (fallback 25). Give a number to "
+                        "force it for any source type.")
+    p.add_argument("--no-retime", action="store_true",
+                   help="keep the original (arrival) timestamps in the saved video, even for HLS")
+    p.add_argument("--rtsp-protocol", choices=["tcp", "udp"], default="tcp",
+                   help="RTSP transport. TCP does not lose packets (recommended).")
+    p.add_argument("--latency", type=int, default=500,
+                   help="RTSP jitter buffer in ms (bigger = safer on a bad network, more delay)")
     p.add_argument("--sample-dir", default="sample_frames")
-    p.add_argument("--sample-every", type=int, default=100, help="save before/after image every N frames (0 = off)")
+    p.add_argument("--save-samples", action="store_true",
+                   help="save before/after sample frames (every 100 frames unless --sample-every is given). "
+                        "Without --save-samples / --sample-every nothing is stored.")
+    p.add_argument("--sample-every", type=int, default=0,
+                   help="save a before/after image every N frames (0 = off)")
+    p.add_argument("--log-dir", default="",
+                   help="folder for detection_logs.jsonl and privacy_audit.jsonl (default: next to --metrics-json)")
+    p.add_argument("--no-logs", action="store_true", help="do not write the two .jsonl log files")
     p.add_argument("--metrics-json", default="metrics.json")
     p.add_argument("--max-seconds", type=float, default=0, help="stop after N seconds (0 = until the end)")
     p.add_argument("--warmup", type=int, default=30, help="frames excluded from the timings")
     p.add_argument("--width", type=int, default=1920, help="nvstreammux width (match your source)")
     p.add_argument("--height", type=int, default=1080, help="nvstreammux height (match your source)")
     p.add_argument("--max-height", type=int, default=720, help="stream quality cap for --rutube-page")
-    p.add_argument("--leaky", action="store_true", help="live: drop old frames instead of queueing when slow")
+    p.add_argument("--leaky", action="store_true",
+                   help="live: drop old frames instead of queueing when slow "
+                        "(NOT recommended for HLS: it drops frames during bursts)")
     p.add_argument("--gpu", type=int, default=0)
     a = p.parse_args()
     if a.rutube_page:
@@ -1015,6 +1377,10 @@ def parse_args():
         print("(full link saved in rutube_link.txt)")
     if not a.source:
         p.error("give --source or --rutube-page")
+    ms = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", a.preview_size)
+    if not ms:
+        p.error("--preview-size must look like 1000x1000")
+    a.preview_w, a.preview_h = int(ms.group(1)), int(ms.group(2))
     if not (a.det_width and a.det_height):
         mm = re.search(r"(\d+)x(\d+)", os.path.basename(a.onnx))
         a.det_width = a.det_width or (int(mm.group(1)) if mm else 640)
@@ -1025,6 +1391,18 @@ def parse_args():
     a.model_name = a.model_name or guess_model_name(a.onnx, a.engine)
     if not os.path.exists(a.engine) and not os.path.exists(a.onnx):
         p.error(f"neither the engine ({a.engine}) nor the ONNX ({a.onnx}) was found")
+        # put everything in one folder (default: logs/)
+    os.makedirs(a.out_dir, exist_ok=True)
+
+    def _in_dir(path):
+        return path if os.path.isabs(path) else os.path.join(a.out_dir, os.path.basename(path))
+
+    a.output = _in_dir(a.output)
+    a.metrics_json = _in_dir(a.metrics_json)
+    a.sample_dir = _in_dir(a.sample_dir)
+    a.log_dir = a.log_dir or a.out_dir
+    if a.save_samples and a.sample_every <= 0:
+        a.sample_every = 100
     if a.sample_every > 0:
         os.makedirs(a.sample_dir, exist_ok=True)
     return a
