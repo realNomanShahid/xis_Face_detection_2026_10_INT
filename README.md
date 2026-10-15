@@ -33,6 +33,7 @@ SCRFD-2.5G and SCRFD-10G were evaluated during research (strong speed) and **dis
 10. [Repository structure](#10-repository-structure)
 11. [Requirements](#11-requirements)
 12. [Known limitations](#12-known-limitations)
+13. [Downlaod Model](#13-retinaface-resnet-50)
 
 ---
 
@@ -332,6 +333,8 @@ PyYAML
 - Prefer **MKV** for shareable live outputs; some MP4 paths play poorly outside VLC.
 
 ---
+## 13. RetinaFace Resnet-50
+ - RetinaFace Resnet-50| [Download](https://drive.google.com/uc?export=download&id=14KX6VqF69MdSPk3Tr9PlDYbq7ArpdNUW) |
 
 ## License
 
