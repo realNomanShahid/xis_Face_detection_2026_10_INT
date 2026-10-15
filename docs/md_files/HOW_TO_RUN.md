@@ -1,121 +1,187 @@
 # How to Run
 
-Simple guide for SCRFD-2.5G, SCRFD-10G, and RetinaFace-R50.
+Simple guide for the **RetinaFace-R50** face detection + GPU blur pipeline.
+
+SCRFD-2.5G and SCRFD-10G were evaluated and **discarded** (accuracy). They are not part of the supported run path.
 
 Before you start, install DeepStream and Python packages → see [INSTALL_DEEPSTREAM.md](INSTALL_DEEPSTREAM.md)
 
-Model details and ONNX download links → see [MODEL.md](MODEL.md)
+Model details and weight / ONNX notes → see [MODEL.md](MODEL.md)
 
 ---
 
-## A. SCRFD-2.5G and SCRFD-10G
+## Supported model
 
-### Step 1 – Get the ONNX file
+| Item | Value |
+|------|--------|
+| Model | **RetinaFace ResNet-50** (pretrained → ONNX → TensorRT) |
+| Typical input | 1280 × 736 |
+| Script | `src/retinaface_face_detection.py` |
+| Defaults | `configs/*.yaml` via `src/config_loader.py` |
 
-Download from [MODEL.md](MODEL.md), or use your own:
+---
 
-- SCRFD 2.5G → `scrfd_2.5g_bnkps_shape640x640.onnx`
-- SCRFD 10G → `scrfd_10g_bnkps.onnx`
+## One-time setup
 
-### Step 2 – Build TensorRT engine (only once)
+### 1. Environment
 
 ```bash
-# SCRFD 2.5G
-python3 scrfd_face_detection.py \
-  --source video.mp4 \
-  --engine scrfd_2.5g.engine \
-  --onnx scrfd_2.5g_bnkps_shape640x640.onnx
+# example: conda env with pyds / DeepStream bindings
+conda activate ds_face   # or your env name
 
-# SCRFD 10G
-python3 scrfd_face_detection.py \
-  --source video.mp4 \
-  --engine scrfd_10g.engine \
-  --onnx scrfd_10g_bnkps.onnx
+export GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream/lib/gst-plugins
+export LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream/lib:$LD_LIBRARY_PATH
+export GI_TYPELIB_PATH=/usr/lib/x86_64-linux-gnu/girepository-1.0
+export GIO_MODULE_DIR=/usr/lib/x86_64-linux-gnu/gio/modules
 ```
 
-DeepStream will create the `.engine` file automatically.
-
-### Step 3 – Run on a video file
+Install YAML support if needed:
 
 ```bash
-# SCRFD 2.5G
-python3 scrfd_face_detection.py \
-  --source video.mp4 \
-  --engine scrfd_2.5g.engine \
-  --output output_blurred.mp4
-
-# SCRFD 10G
-python3 scrfd_face_detection.py \
-  --source video.mp4 \
-  --engine scrfd_10g.engine \
-  --output output_blurred.mp4
+pip install PyYAML
 ```
 
-### Step 4 – Run on RTSP / live stream
+### 2. Convert PyTorch weights → ONNX (once)
 
 ```bash
-python3 scrfd_face_detection.py \
-  --source rtsp://127.0.0.1:8554/stream \
-  --engine scrfd_2.5g.engine \
-  --output live_blurred.mp4 \
+python3 src/pytorch_to_onnx_retinaface.py
+```
+
+This produces the ONNX file used by DeepStream (name must match `configs/detection.yaml` → `onnx_path`).
+
+### 3. Build TensorRT engine (once)
+
+First run with `--onnx` builds the engine if it is missing:
+
+```bash
+python3 src/retinaface_face_detection.py \
+  --source path/to/video.mp4 \
+  --onnx retinaface_r50_1280x736.onnx \
+  --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine
+```
+
+Or rely on paths already set in `configs/detection.yaml` and only pass `--source`.
+
+DeepStream / nvinfer creates the `.engine` file automatically. Later runs reuse it.
+
+---
+
+## Config files (preferred)
+
+All important paths and thresholds live under `configs/`:
+
+| File | Controls |
+|------|----------|
+| `configs/pipeline.yaml` | resolution, `out_dir`, output name, GPU, retime |
+| `configs/detection.yaml` | ONNX / engine paths, conf, NMS, input size |
+| `configs/blur.yaml` | pad, blur strength, hold frames |
+| `configs/camera.yaml` | RTSP / ONVIF camera |
+| `configs/encode.yaml` | codec, bitrate |
+| `configs/preview.yaml` | live window |
+| `configs/logging.yaml` | metrics, samples, `detected_instances` |
+
+CLI flags **override** YAML for a single run.
+
+Loader: `src/config_loader.py` → `load_all()`.
+
+---
+
+## A. Run on a video file
+
+```bash
+python3 src/retinaface_face_detection.py \
+  --source video.mp4 \
+  --onnx retinaface_r50_1280x736.onnx \
+  --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine \
+  --output output_blurred.mkv \
+  --width 1280 --height 720 \
+  --conf 0.15
+```
+
+With defaults already in YAML (minimal CLI):
+
+```bash
+python3 src/retinaface_face_detection.py --source video.mp4
+```
+
+---
+
+## B. Run on office RTSP camera
+
+Set password in the environment (do not commit secrets):
+
+```bash
+export CAM_ONVIF_PASSWORD='your_password'
+```
+
+Password characters must be URL-encoded in a hand-built URL (`#` → `%23`).
+
+**Option 1 – full URL on CLI**
+
+```bash
+python3 src/retinaface_face_detection.py \
+  --source "rtsp://dev_use:Pass123%23@10.11.4.254:554/rtsp_tunnel?p=1&line=1&inst=1&vcd=2" \
+  --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine \
+  --onnx retinaface_r50_1280x736.onnx \
+  --width 1536 --height 864 \
+  --conf 0.15 \
+  --rtsp-protocol tcp \
+  --latency 500 \
+  --preview \
+  --output camera_blurred.mkv
+```
+
+**Option 2 – `configs/camera.yaml` + env password**
+
+```bash
+python3 src/retinaface_face_detection.py --preview
+```
+
+(Requires `source` / camera fields configured so the script can build the RTSP URI.)
+
+---
+
+## C. Run on Rutube (HLS)
+
+```bash
+python3 src/retinaface_face_detection.py \
+  --rutube-page "https://rutube.ru/live/video/<id>/" \
+  --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine \
+  --onnx retinaface_r50_1280x736.onnx \
+  --width 1280 --height 720 \
+  --max-height 720 \
+  --conf 0.15 \
+  --out-fps 12 \
   --max-seconds 60 \
-  --width 1280 \
-  --height 720 \
-  --leaky
+  --preview
 ```
+
+Use `--out-fps` close to the delivered live rate so the saved video duration matches wall time.
 
 ---
 
-## B. RetinaFace-R50
-
-RetinaFace needs one extra step: convert the PyTorch `.pth` weights to ONNX first.
-
-### Step 1 – Convert .pth → ONNX
+## D. Live preview
 
 ```bash
-python3 pytorch_to_onnx_retinaface.py
+python3 src/retinaface_face_detection.py \
+  --source "rtsp://..." \
+  --preview \
+  --preview-size 1000x1000
 ```
 
-This creates the ONNX file (for example `retinaface_r50.onnx`).
-
-### Step 2 – Build TensorRT engine (only once)
-
-```bash
-python3 retinaface_face_detection.py \
-  --source video.mp4 \
-  --engine retinaface_r50.engine \
-  --onnx retinaface_r50.onnx
-```
-
-### Step 3 – Run on a video file
-
-```bash
-python3 retinaface_face_detection.py \
-  --source video.mp4 \
-  --engine retinaface_r50.engine \
-  --output output_blurred.mp4
-```
-
-### Step 4 – Run on RTSP / live stream
-
-```bash
-python3 retinaface_face_detection.py \
-  --source rtsp://127.0.0.1:8554/stream \
-  --engine retinaface_r50.engine \
-  --output live_blurred.mp4 \
-  --max-seconds 60 \
-  --width 1280 \
-  --height 720 \
-  --leaky
-```
+- Needs a desktop session (`DISPLAY`) and GStreamer X plugin (`gstreamer1.0-x`).
+- Overlay shows **Persons** (faces in current frame) and **FPS**.
+- Boxes are preview-only; they are **not** burned into the saved video.
+- Disable boxes: `--no-preview-boxes`
+- Force off if YAML has preview enabled: `--no-preview`
 
 ---
 
-## C. High-FPS Test (optional)
+## E. High-FPS test (optional)
 
-To measure maximum pipeline speed, use a local high-rate RTSP server.
+Measures maximum pipeline speed. Not the normal camera rate.
 
-**Terminal 1 – start RTSP server**
+**Terminal 1 – local RTSP (no `-re`)**
 
 ```bash
 ffmpeg -stream_loop -1 -i video.mp4 \
@@ -123,59 +189,90 @@ ffmpeg -stream_loop -1 -i video.mp4 \
   -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/stream
 ```
 
-> Do **not** use `-re`. That forces real-time (~25 FPS).
+Optional: MediaMTX under `tools/` (see [HIGH_FPS_RTSP.md](HIGH_FPS_RTSP.md)).
 
-**Terminal 2 – run pipeline** (SCRFD or RetinaFace)
+**Terminal 2 – pipeline**
 
 ```bash
-python3 scrfd_face_detection.py \
+python3 src/retinaface_face_detection.py \
   --source rtsp://127.0.0.1:8554/stream \
-  --engine scrfd_2.5g.engine \
-  --output live_blurred.mp4 \
+  --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine \
+  --output live_blurred.mkv \
   --max-seconds 60 \
-  --width 1280 \
-  --height 720 \
-  --leaky
+  --width 1280 --height 720
 ```
 
 More detail → [HIGH_FPS_RTSP.md](HIGH_FPS_RTSP.md)
 
 ---
 
-## Useful Arguments
+## Useful arguments
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--source` | – | Video file or RTSP/HLS URL |
-| `--engine` | – | TensorRT engine file (required) |
-| `--onnx` | – | Optional ONNX to rebuild engine |
-| `--output` | `output_blurred.mp4` | Output video |
-| `--det-size` | `640` | Model input size (SCRFD) |
-| `--conf` | `0.35` | Detection confidence |
-| `--pad` | `0.20` | Face box padding |
-| `--blur-frac` | `0.25` | Blur strength |
-| `--max-seconds` | `0` | Stop after N seconds (0 = full) |
-| `--width` / `--height` | `1920` / `1080` | Streammux size |
-| `--leaky` | off | Drop old frames when slow (good for live) |
-| `--sample-every` | `100` | Save before/after images every N frames |
-| `--gpu` | `0` | GPU index |
-
----
-
-## Output Files
-
-| File | Description |
-|------|-------------|
-| `output_blurred.mp4` | Blurred video |
-| `metrics.json` | Full performance metrics |
-| `sample_frames/` | Before/after images (if enabled) |
+| Argument | Config key (typical) | Description |
+|----------|----------------------|-------------|
+| `--source` | `pipeline.source` / `camera.*` | File, RTSP, or HLS URL |
+| `--rutube-page` | `pipeline.rutube_page` | Resolve Rutube page → m3u8 |
+| `--onnx` | `detection.onnx_path` | ONNX for engine build |
+| `--engine` | `detection.engine_path` | TensorRT engine |
+| `--conf` | `detection.conf` | Face score threshold |
+| `--nms` | `detection.nms` | NMS IoU |
+| `--pad` | `blur.pad` | Box padding |
+| `--blur-frac` | `blur.blur_frac` | Blur strength |
+| `--hold` | `blur.hold_frames` | Reuse last boxes on short misses |
+| `--output` | `pipeline.output` | Prefer `.mkv` for shareable files |
+| `--out-dir` | `pipeline.out_dir` | Logs / video / detection images |
+| `--width` / `--height` | `pipeline.width` / `height` | nvstreammux size |
+| `--rtsp-protocol` | `camera.rtsp_protocol` | `tcp` recommended |
+| `--latency` | `camera.latency_ms` | RTSP jitter buffer (ms) |
+| `--preview` | `preview.enabled` | Live window |
+| `--max-seconds` | `pipeline.max_seconds` | 0 = until end / Ctrl+C |
+| `--out-fps` | `pipeline.out_fps` | Steady timestamps for saved video |
+| `--sample-every` | `logging.sample_every` | Periodic before/after samples |
+| `--no-save-detections` | inverse of `logging.save_detections` | Skip `detected_instances/` |
+| `--gpu` | `pipeline.gpu_id` | GPU index |
 
 ---
 
-## Quick Checklist
+## Output files
+
+Typical location: under `logs/` when `out_dir: logs` (or `results/` if you change config).
+
+| File / folder | Description |
+|---------------|-------------|
+| `*.mkv` / `*.mp4` | Blurred video (MKV recommended) |
+| `metrics.json` | Performance + privacy-audit summary |
+| `detection_logs.jsonl` | Per-frame detections |
+| `privacy_audit.jsonl` | Per-frame blur audit |
+| `detected_instances/` | Frames where a face was detected and blurred (on by default) |
+| `sample_frames/` | Optional periodic before/after pairs |
+
+Example archived results for this model: `results/RetinaFace_resnet50/`.
+
+---
+
+## Stop and report
+
+Press **Ctrl+C** at any time. The pipeline sends EOS, finalises the video, and prints the performance report.
+
+---
+
+## Quick checklist
 
 1. Install DeepStream → [INSTALL_DEEPSTREAM.md](INSTALL_DEEPSTREAM.md)
-2. Download ONNX → [MODEL.md](MODEL.md)
-3. **SCRFD:** run `scrfd_face_detection.py` with `--onnx` once to build engine, then run normally
-4. **RetinaFace:** run `pytorch_to_onnx_retinaface.py` first, then `retinaface_face_detection.py`
-5. See results → [RESULTS.md](RESULTS.md)
+2. Convert weights → `python3 src/pytorch_to_onnx_retinaface.py`
+3. Set `configs/detection.yaml` paths (ONNX / engine)
+4. Build engine once (first run with ONNX)
+5. Run file / RTSP / Rutube with `src/retinaface_face_detection.py`
+6. Prefer **`.mkv`** for saved live video
+7. See results → [RESULTS.md](RESULTS.md) and `results/RetinaFace_resnet50/`
+
+---
+
+## Not supported (discarded)
+
+| Model | Status |
+|-------|--------|
+| SCRFD-2.5G | Evaluated; **not** the production path |
+| SCRFD-10G | Evaluated; **not** the production path |
+
+Historical comparison PDFs may remain under `docs/` for the archive only. Do not use SCRFD scripts for new runs.

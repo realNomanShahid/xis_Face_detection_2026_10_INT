@@ -1,0 +1,37 @@
+# Top-level pipeline settings (DeepStream + RetinaFace face blur)
+
+# GPU index for nvinfer / convert / encode
+gpu_id: 0
+
+# nvstreammux nominal size (match source when possible)
+width: 1536
+height: 864
+
+# Stop after N seconds (0 = run until EOS / Ctrl+C)
+max_seconds: 0
+
+# Frames excluded from timing stats at start
+warmup_frames: 30
+
+# Live queue policy: true = drop old frames when slow (not recommended for HLS)
+leaky: false
+
+# Output directory for video, metrics, logs, detection images
+out_dir: "logs"
+
+# Output video filename (extension selects muxer: .mkv → matroskamux, .mp4 → qtmux)
+output: "camera_blurred.mkv"
+
+# Source selection (CLI can override)
+# Examples:
+#   file: "video.mp4"
+#   rtsp: "rtsp://user:pass@host:554/path"
+#   leave null and pass --source / --rutube-page on CLI
+source: null
+rutube_page: null
+max_height_rutube: 720
+
+# Retiming of saved video timestamps (HLS burstiness)
+# 0 = automatic for http(s)/HLS only; >0 forces that FPS for any source
+out_fps: 0
+no_retime: false

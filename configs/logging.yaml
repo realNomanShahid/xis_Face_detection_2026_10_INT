@@ -1,0 +1,16 @@
+# Metrics, jsonl logs, sample frames, detection-instance images
+
+metrics_json: "metrics.json"
+
+# detection_logs.jsonl + privacy_audit.jsonl (under out_dir unless absolute)
+write_jsonl_logs: true
+log_dir: null                 # null = use pipeline.out_dir
+
+# Periodic before/after samples (left original | right blurred)
+save_samples: false
+sample_every: 0               # 0 = off; with save_samples true defaults to 100 in code if still 0
+sample_dir: "sample_frames"
+
+# Every frame where a face was detected and blurred (blurred image only if you patched save)
+save_detections: true
+detected_dir: "detected_instances"

@@ -1,0 +1,11 @@
+# GPU ellipse face blur (CUDA kernels)
+
+# Expand each face box by this fraction before blur
+pad: 0.20
+
+# Blur radius as a fraction of max(box_w, box_h); clamped in code (e.g. 3..60 px)
+blur_frac: 0.25
+
+# Keep last face boxes for this many frames when current frame has zero detections
+# Reduces unblurred flashes on brief misses
+hold_frames: 5

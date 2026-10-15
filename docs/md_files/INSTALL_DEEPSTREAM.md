@@ -1,19 +1,40 @@
 # DeepStream Face Blur – Complete Installation & Run Guide
 
+**RetinaFace-R50 only** (SCRFD paths discarded)
+
 **Simple step-by-step guide** for Ubuntu 22.04 + NVIDIA GPU  
 (Tested with RTX 5080, Driver 595.99, DeepStream 7.1)
+
+SCRFD-2.5G / SCRFD-10G were evaluated for speed but **not accepted for accuracy**.  
+This guide covers the **supported** stack only: DeepStream + TensorRT + **RetinaFace ResNet-50**.
+
+Project layout (reference):
+
+```text
+face/
+  configs/          # YAML defaults
+  src/
+    config_loader.py
+    pytorch_to_onnx_retinaface.py
+    retinaface_face_detection.py
+  docs/md_files/
+  results/RetinaFace_resnet50/
+```
+
+How to run after install → [HOW_TO_RUN.md](HOW_TO_RUN.md)
 
 ---
 
 ## 1. System Requirements
 
-| Item              | Required                          |
-|-------------------|-----------------------------------|
-| OS                | Ubuntu 22.04 LTS                  |
-| GPU               | NVIDIA GPU (RTX series preferred) |
-| NVIDIA Driver     | Working (`nvidia-smi` must work)  |
-| CUDA (from driver)| 12.x or higher                    |
-| Python            | 3.10 (important!)                 |
+| Item | Required |
+|------|----------|
+| OS | Ubuntu 22.04 LTS |
+| GPU | NVIDIA GPU (RTX series preferred) |
+| NVIDIA Driver | Working (`nvidia-smi` must work) |
+| CUDA (from driver) | 12.x or higher |
+| Python | **3.10** (required for official `pyds` wheel) |
+| Model | RetinaFace-R50 ONNX → TensorRT engine |
 
 ---
 
@@ -22,18 +43,19 @@
 If you see **"Driver/library version mismatch"**:
 
 ```bash
-# Just reboot the machine
 sudo reboot
 ```
 
-After reboot, check:
+After reboot:
 
 ```bash
 nvidia-smi
 ```
 
-You must see a clean table with GPU name and driver version.  
+You must see a clean table (GPU name + driver version).  
 **Do not continue until `nvidia-smi` works.**
+
+On company machines, prefer reboot over forced `rmmod` when modules are in use.
 
 ---
 
@@ -54,12 +76,14 @@ sudo apt install -y \
   protobuf-compiler gcc make git python3 \
   python3-gi python3-dev python3-gst-1.0 python-gi-dev \
   libgirepository1.0-dev libcairo2-dev \
+  gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+  gstreamer1.0-x \
   build-essential cmake
 ```
 
 ---
 
-## 4. Install CUDA Toolkit 12.6 (only toolkit, no new driver)
+## 4. Install CUDA Toolkit 12.6 (toolkit only, no new driver)
 
 ```bash
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
@@ -70,7 +94,7 @@ sudo apt install -y cuda-toolkit-12-6
 
 ---
 
-## 5. Install TensorRT (needed by DeepStream)
+## 5. Install TensorRT packages (needed by DeepStream)
 
 ```bash
 sudo apt install -y \
@@ -80,23 +104,29 @@ sudo apt install -y \
   libnvinfer-headers-dev libnvinfer-headers-plugin-dev
 ```
 
+Package names can vary slightly by Ubuntu mirror; if a name is missing, search with:
+
+```bash
+apt-cache search nvinfer | head
+```
+
 ---
 
 ## 6. Download & Install DeepStream 7.1
 
-### Download link (official):
+### Official download
 
 **https://catalog.ngc.nvidia.com/orgs/nvidia/resources/deepstream/files?version=7.1**
 
-Download this file only:
+Download:
 
+```text
+deepstream-7.1_7.1.0-1_amd64.deb
 ```
-deepstream-7.1_7.1.0-1_amd64.deb   (~742 MB)
-```
 
-You need a free NVIDIA account to download.
+(Free NVIDIA developer account required.)
 
-### Install:
+### Install
 
 ```bash
 cd ~/Downloads
@@ -104,7 +134,9 @@ sudo dpkg -i deepstream-7.1_7.1.0-1_amd64.deb
 sudo apt --fix-broken install -y
 ```
 
-### Set environment variables (permanent):
+If `dpkg` reports missing CUDA/GStreamer deps, `apt --fix-broken install -y` should pull them. Re-run the `.deb` install if needed.
+
+### Environment variables (permanent)
 
 ```bash
 echo 'export GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream/lib/gst-plugins' >> ~/.bashrc
@@ -113,27 +145,34 @@ echo 'export PATH=/opt/nvidia/deepstream/deepstream/bin:$PATH' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-### Verify:
+Also useful for Python GI / TLS on some machines:
+
+```bash
+echo 'export GI_TYPELIB_PATH=/usr/lib/x86_64-linux-gnu/girepository-1.0' >> ~/.bashrc
+echo 'export GIO_MODULE_DIR=/usr/lib/x86_64-linux-gnu/gio/modules' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### Verify
 
 ```bash
 deepstream-app --version
 ```
 
-You should see:
+Expected:
 
-```
+```text
 deepstream-app version 7.1.0
 DeepStreamSDK 7.1.0
 ```
 
 ---
 
-## 7. Create Python Environment (Python 3.10 is required)
+## 7. Create Python Environment (Python 3.10)
 
-The official `pyds` wheel only works with **Python 3.10**.
+The official `pyds` wheel targets **cp310**.
 
 ```bash
-# Using conda (recommended)
 conda create -n ds_face python=3.10 -y
 conda activate ds_face
 ```
@@ -142,7 +181,7 @@ conda activate ds_face
 
 ## 8. Install Python packages
 
-### Create `requirements.txt`:
+### `requirements.txt` (minimum for this project)
 
 ```txt
 numpy
@@ -150,60 +189,69 @@ cupy-cuda12x
 opencv-python-headless
 nvidia-ml-py
 requests
+PyYAML
 ```
-
-### Install:
 
 ```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+Use `cupy-cuda11x` only if your CUDA major version is 11.
+
 ---
 
 ## 9. Install DeepStream Python bindings (`pyds`)
 
-### Download official wheel (Python 3.10 + x86_64):
-
 ```bash
 wget https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.0/pyds-1.2.0-cp310-cp310-linux_x86_64.whl
-```
-
-### Install:
-
-```bash
 pip install pyds-1.2.0-cp310-cp310-linux_x86_64.whl
 ```
 
-### Test:
+### Test
 
 ```bash
 python -c "import pyds; print('pyds OK')"
 python -c "import cupy; print('cupy OK')"
+python -c "from gi.repository import Gst; print('Gst OK')"
 ```
 
-Both must print OK.
+All should succeed inside the `ds_face` env.
 
 ---
 
-## 10. Prepare model files
+## 10. Prepare RetinaFace model files
 
-You need:
+| File | Role |
+|------|------|
+| Pretrained PyTorch weights | Official RetinaFace-R50 (see [MODEL.md](MODEL.md)) |
+| ONNX | e.g. `retinaface_r50_1280x736.onnx` |
+| TensorRT engine | e.g. `retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine` |
 
-| File                        | Description                          |
-|-----------------------------|--------------------------------------|
-| `scrfd_2.5g_bnkps.onnx`     | Original ONNX model (required once)  |
-| `scrfd_2.5g_fp16.trt`       | Your old engine (may not work)       |
+### Convert PyTorch → ONNX (once)
 
-**Important:**  
-If your `.trt` / `.engine` was built with a different TensorRT version, DeepStream cannot load it.  
-In that case you **must** pass the ONNX file so DeepStream can rebuild a compatible engine.
+```bash
+python3 src/pytorch_to_onnx_retinaface.py
+```
+
+### Build engine (once)
+
+First DeepStream run with `--onnx` builds a compatible engine if the old `.engine` / `.trt` does not match your TensorRT version:
+
+```bash
+python3 src/retinaface_face_detection.py \
+  --source video.mp4 \
+  --onnx retinaface_r50_1280x736.onnx \
+  --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine
+```
+
+Set the same paths in `configs/detection.yaml` so later runs need fewer flags.
+
+**Do not** use SCRFD ONNX/engines for this project path.
 
 ---
 
-## 11. Run the Face Blur Script
-
-### First run (rebuilds engine if needed):
+## 11. Run the Face Blur Script (RetinaFace)
 
 ```bash
 conda activate ds_face
@@ -211,90 +259,123 @@ conda activate ds_face
 export GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream/lib/gst-plugins
 export LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream/lib:$LD_LIBRARY_PATH
 export PATH=/opt/nvidia/deepstream/deepstream/bin:$PATH
-
-python face_blur_deepstream.py \
-  --source video.mp4 \
-  --engine scrfd_2.5g_fp16.trt \
-  --onnx scrfd_2.5g_bnkps.onnx \
-  --output output_blurred.mp4
+export GI_TYPELIB_PATH=/usr/lib/x86_64-linux-gnu/girepository-1.0
 ```
 
-DeepStream will create a new engine file, for example:
-
-```
-scrfd_2.5g_bnkps.onnx_b1_gpu0_fp16.engine
-```
-
-### Later runs (use the new engine only):
+### Video file
 
 ```bash
-python face_blur_deepstream.py \
+python3 src/retinaface_face_detection.py \
   --source video.mp4 \
-  --engine scrfd_2.5g_bnkps.onnx_b1_gpu0_fp16.engine \
-  --output output_blurred.mp4
+  --onnx retinaface_r50_1280x736.onnx \
+  --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine \
+  --output output_blurred.mkv \
+  --conf 0.15
 ```
+
+### Live RTSP (example)
+
+```bash
+python3 src/retinaface_face_detection.py \
+  --source "rtsp://user:ENCODED_PASS@host:554/path" \
+  --engine retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine \
+  --onnx retinaface_r50_1280x736.onnx \
+  --width 1536 --height 864 \
+  --rtsp-protocol tcp --latency 500 \
+  --preview \
+  --output camera_blurred.mkv
+```
+
+Prefer **`.mkv`** for shareable live recordings.
+
+Defaults (conf, paths, out_dir, etc.) can come from `configs/*.yaml` — see [HOW_TO_RUN.md](HOW_TO_RUN.md) and [README_CONFIG.md](../../README_CONFIG.md).
 
 ---
 
 ## 12. Useful optional flags
 
-| Flag              | Meaning                              | Example        |
-|-------------------|--------------------------------------|----------------|
-| `--max-seconds`   | Stop after N seconds                 | `--max-seconds 60` |
-| `--width`         | Mux width                            | `--width 1920` |
-| `--height`        | Mux height                           | `--height 1080`|
-| `--sample-every`  | Save before/after images every N frames | `--sample-every 50` |
-| `--leaky`         | Drop old frames on live streams      | `--leaky`      |
-| `--conf`          | Detection confidence                 | `--conf 0.35`  |
-| `--blur-frac`     | Blur strength                        | `--blur-frac 0.25` |
+| Flag | Meaning | Example |
+|------|---------|---------|
+| `--max-seconds` | Stop after N seconds | `--max-seconds 60` |
+| `--width` / `--height` | nvstreammux size | `--width 1536 --height 864` |
+| `--conf` | Detection threshold | `--conf 0.15` |
+| `--preview` | Live window | `--preview` |
+| `--out-fps` | Steady timestamps for saved video | `--out-fps 12` |
+| `--sample-every` | Periodic samples | `--sample-every 100` |
+| `--no-save-detections` | Skip `detected_instances/` | |
+| `--rtsp-protocol tcp` | Reliable RTSP | |
+| `--latency` | RTSP jitter buffer (ms) | `--latency 500` |
 
 ---
 
 ## 13. Output files
 
-After a successful run you will get:
+After a successful run (often under `logs/` when `out_dir: logs`):
 
-- `output_blurred.mp4`          → final video with faces blurred
-- `metrics.json`                → performance report
-- `sample_frames/`              → before/after images (if `--sample-every` used)
-- `*.engine`                    → new TensorRT engine built by DeepStream
+| Output | Description |
+|--------|-------------|
+| `*.mkv` / `*.mp4` | Blurred video |
+| `metrics.json` | Performance + privacy audit summary |
+| `detection_logs.jsonl` | Per-frame detections |
+| `privacy_audit.jsonl` | Per-frame blur audit |
+| `detected_instances/` | Frames with detection + blur (default on) |
+| `sample_frames/` | Optional before/after pairs |
+| `*.engine` | TensorRT engine built/reused by nvinfer |
 
----
-
-## 14. Common Problems & Solutions
-
-| Problem                                      | Solution |
-|----------------------------------------------|----------|
-| `nvidia-smi` fails with version mismatch     | Reboot the machine |
-| `No module named 'pyds'`                     | Use Python 3.10 + install the official wheel |
-| Engine version mismatch (243 vs 240)         | Pass `--onnx` so DeepStream rebuilds the engine |
-| `Could not create 'nvurisrcbin'`             | Check `GST_PLUGIN_PATH` and `LD_LIBRARY_PATH` |
-| `cupy` CUDA error                            | Use `cupy-cuda12x` (not cuda11x) |
+Archived example results: `results/RetinaFace_resnet50/`.
 
 ---
 
-## 15. Quick Checklist
+## 14. Common problems & solutions
 
-- [ ] `nvidia-smi` works
-- [ ] `deepstream-app --version` shows 7.1.0
-- [ ] Conda env with **Python 3.10**
-- [ ] `python -c "import pyds"` works
-- [ ] `python -c "import cupy"` works
-- [ ] ONNX file available (for first run)
-- [ ] Environment variables set
-
----
-
-## 16. Download Links Summary
-
-| Item                          | Link |
-|-------------------------------|------|
-| DeepStream 7.1 `.deb`         | https://catalog.ngc.nvidia.com/orgs/nvidia/resources/deepstream/files?version=7.1 |
-| `pyds` Python wheel (3.10)    | https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.0/pyds-1.2.0-cp310-cp310-linux_x86_64.whl |
-| CUDA keyring                  | https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb |
+| Problem | Solution |
+|---------|----------|
+| `nvidia-smi` driver/library mismatch | Reboot |
+| `No module named 'pyds'` | Python **3.10** + official wheel |
+| `Namespace Gst not available` | Install `gir1.2-gstreamer-1.0` and set `GI_TYPELIB_PATH` |
+| Engine serialize version mismatch | Pass `--onnx` so DeepStream rebuilds the engine |
+| `Could not create 'nvurisrcbin'` | Check `GST_PLUGIN_PATH` and `LD_LIBRARY_PATH` |
+| `cupy` CUDA error | Match `cupy-cuda12x` to CUDA 12 |
+| RTSP `401 Unauthorized` | URL-encode password; use correct ONVIF/RTSP user |
+| MP4 only plays in VLC / artifacts | Save as **`.mkv`** or re-encode with ffmpeg |
+| GStreamer warnings (`libtritonserver`, `librivermax`) | Harmless if you do not use those plugins |
 
 ---
 
-**Done!**  
-You now have a working DeepStream + TensorRT face-blur pipeline.  
-Save this file and follow the steps in order on any similar machine.
+## 15. Quick checklist
+
+- [ ] `nvidia-smi` works  
+- [ ] `deepstream-app --version` shows 7.1.0  
+- [ ] Conda env with **Python 3.10**  
+- [ ] `import pyds`, `import cupy`, `Gst` OK  
+- [ ] RetinaFace ONNX available  
+- [ ] Engine built once for this machine  
+- [ ] `configs/detection.yaml` paths set  
+- [ ] Environment variables set  
+
+---
+
+## 16. Download links summary
+
+| Item | Link |
+|------|------|
+| DeepStream 7.1 `.deb` | https://catalog.ngc.nvidia.com/orgs/nvidia/resources/deepstream/files?version=7.1 |
+| `pyds` wheel (Python 3.10) | https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.0/pyds-1.2.0-cp310-cp310-linux_x86_64.whl |
+| CUDA keyring | https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb |
+
+---
+
+## 17. Out of scope
+
+| Item | Status |
+|------|--------|
+| SCRFD-2.5G / SCRFD-10G install or run | **Not supported** (discarded) |
+| Jetson | Not supported (`get_nvds_buf_surface_gpu` is x86-only in this design) |
+| Fine-tuning RetinaFace on company data | Not part of this install guide |
+
+Historical SCRFD PDFs under `docs/` are archive only.
+
+---
+
+**Done.**  
+After install, follow [HOW_TO_RUN.md](HOW_TO_RUN.md) for file / RTSP / Rutube / preview runs.

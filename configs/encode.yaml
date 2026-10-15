@@ -1,0 +1,12 @@
+# NVENC encode + container
+
+codec: "h264"                 # h264 | h265
+bitrate: 8000000              # bits per second
+iframeinterval: 30
+
+# Insert SPS/PPS periodically when encoder supports the property
+insert_sps_pps: true
+
+# Container is chosen from pipeline.output extension in code:
+#   .mkv / .webm → matroskamux
+#   .mp4         → qtmux (no fragment-duration for shareable files)

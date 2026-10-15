@@ -1,0 +1,10 @@
+# Live preview window (optional; requires DISPLAY + gstreamer1.0-x)
+
+enabled: false
+# Max window box; video keeps aspect ratio and fits inside
+max_width: 1000
+max_height: 1000
+# Preview refresh rate (does not change saved video FPS)
+fps: 15
+# Draw green detection boxes in preview only (never burned into saved file)
+draw_boxes: true

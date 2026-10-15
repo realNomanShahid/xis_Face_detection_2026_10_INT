@@ -1,0 +1,30 @@
+# Live camera / RTSP settings
+# Secrets: prefer environment variables in production; values here are for local/dev.
+
+# Default office camera (ONVIF → RTSP). Override via CLI --source when needed.
+ip: "10.11.4.254"
+onvif_port: 80
+rtsp_port: 554
+
+onvif_user: "dev_use"
+# Prefer env: CAM_ONVIF_PASSWORD — do not commit real passwords to git if repo is shared
+onvif_password_env: "CAM_ONVIF_PASSWORD"
+# Optional fallback for local-only configs (leave null in shared repos)
+onvif_password: null
+
+# Profile index from ONVIF GetProfiles (0 = often 4K, 1 = 1536x864 on this camera)
+profile_index: 1
+
+# Stream path template after ONVIF discovery (camera-specific)
+# Working example used in project:
+#   rtsp://dev_use:ENCODED_PASS@10.11.4.254:554/rtsp_tunnel?p=1&line=1&inst=1&vcd=2
+rtsp_path: "/rtsp_tunnel?p=1&line=1&inst=1&vcd=2"
+
+# DeepStream nvurisrcbin
+rtsp_protocol: "tcp"          # tcp | udp
+latency_ms: 500               # jitter buffer
+rtsp_reconnect_interval_s: 5
+
+# Optional full URI (if set, skips building from ip/user/path)
+# Password must be URL-encoded (# → %23, ! → %21)
+rtsp_url: null

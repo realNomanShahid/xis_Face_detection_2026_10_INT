@@ -1,0 +1,23 @@
+# RetinaFace-R50 detection (nvinfer + decode / NMS)
+# SCRFD paths are out of scope (discarded).
+
+model_name: "RetinaFace-R50"
+
+# Paths relative to project root unless absolute
+onnx_path: "retinaface_r50_1280x736.onnx"
+# Empty engine_path → built as <onnx>_b1_gpu{gpu}_fp16.engine on first run
+engine_path: "retinaface_r50_1280x736.onnx_b1_gpu0_fp16.engine"
+
+# Must match ONNX / engine input
+det_width: 1280
+det_height: 736
+
+# Face score threshold (lower = more detections, more false positives)
+# Soak evidence used 0.15 on wide office camera; raise for cleaner scenes
+conf: 0.15
+
+# Non-maximum suppression IoU
+nms: 0.4
+
+# Max candidates kept before NMS after score filter (code safety cap)
+max_candidates_before_nms: 1000
