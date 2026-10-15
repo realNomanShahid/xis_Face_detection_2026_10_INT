@@ -75,7 +75,7 @@ def main():
     from models.retinaface import RetinaFace
     import models.net as repo_net
 
-    # With a fixed size that is a multiple of 32, "upsample x2" is exactly what the original
+    # With a fixed size that is a multiple of 32, "upsample-x2" is exactly what the original
     # code computes from tensor sizes. A constant scale exports to a simpler, TensorRT-friendly ONNX.
     def fpn_forward(self, inp):
         inp = list(inp.values())

@@ -53,7 +53,7 @@ Not a training-curve report (no company train).
 | Zero-detect frames | 98.8% |
 | Hold frames | 1,412 |
 
-Interpretation: scene often empty or faces too small for reliable fire; not evidence of 30 FPS failure.
+Interpretation: scene often empty or faces too small for reliable fire; not evidence of 30 FPS failure .
 
 ---
 

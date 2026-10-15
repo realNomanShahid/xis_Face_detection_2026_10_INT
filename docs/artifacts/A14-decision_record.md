@@ -24,7 +24,7 @@
 
 | Field | Content |
 | ----- | ------- |
-| Decision | Use official/public pretrained RetinaFace-R50 → ONNX → TensorRT. No company training run. |
+| Decision | Use official/public pretrained RetinaFace-R50 → ONNX → TensorRT. No company training run.|
 | Decider | Noman |
 | Date | 2026-10-12 |
 | Consequences | A03–A05 largely N/A; A07 is engine-build record |

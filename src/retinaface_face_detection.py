@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 face_blur_deepstream_retinaface.py
 ==================================

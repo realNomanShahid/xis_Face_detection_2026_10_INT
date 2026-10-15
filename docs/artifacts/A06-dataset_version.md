@@ -10,7 +10,7 @@
 ## Purpose
 
 Locks the **version identity** of what runs in evaluation and soak.  
-For this project that is the **ONNX + TensorRT engine**, not a labelled dataset version.
+For this project that is the **ONNX + TensorRT engine**, not a labelled dataset version .
 
 ---
 

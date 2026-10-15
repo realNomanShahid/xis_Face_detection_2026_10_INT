@@ -334,7 +334,7 @@ PyYAML
 
 ---
 ## 13. RetinaFace Resnet-50
- - RetinaFace Resnet-50| [Download](https://drive.google.com/uc?export=download&id=14KX6VqF69MdSPk3Tr9PlDYbq7ArpdNUW) |
+ - RetinaFace Resnet-50 | [Download](https://drive.google.com/uc?export=download&id=14KX6VqF69MdSPk3Tr9PlDYbq7ArpdNUW) |
 
 ## License
 

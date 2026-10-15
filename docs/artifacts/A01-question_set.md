@@ -11,7 +11,7 @@
 ## Purpose of this artifact
 
 Frames the problem before the detector and delivery path are locked.  
-Records what decision the system supports, what is observed, what data enters the system, and under what operating conditions it must run.
+Records what decision the system supports, what is observed, what data enters the system, and under what operating conditions it must run .
 
 ---
 
