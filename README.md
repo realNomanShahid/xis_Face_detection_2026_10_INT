@@ -100,7 +100,7 @@ Only small detector output tensors are copied to CPU for box decoding and NMS.
 |--------|--------|-------|
 | Stream decode (NVDEC) | **GPU** | Hardware decode |
 | Face detection (TensorRT) | **GPU** | RetinaFace-R50 engine |
-| Post-process (decode + NMS) | CPU (lightweight) | Tiny tensors only |
+| Post-process (decode + NMS) | **GPU** | tensors|
 | Face blur (CUDA kernels) | **GPU** | Separable blur inside face ellipse |
 | Video encode (NVENC) | **GPU** | H.264 / H.265 |
 | Mux / queues (DeepStream) | **GPU** | Zero-copy buffers |
