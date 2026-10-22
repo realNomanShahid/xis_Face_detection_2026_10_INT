@@ -1,7 +1,22 @@
-numpy
-cupy-cuda12x
-opencv-python-headless
-nvidia-ml-py
-nvidia-nvimgcodec-cu12
-requests
+# Runtime dependencies for src/retinaface_face_detection.py
+# Python 3.10, x86_64 Linux, NVIDIA GPU, CUDA 12.x
+#
+# NOT installable from this file (install separately, see docs/md_files/INSTALL_DEEPSTREAM.md):
+#   - DeepStream SDK (.deb from NVIDIA NGC)
+#   - pyds (DeepStream Python bindings): wheel must match your DeepStream version,
+#     e.g. DeepStream 7.1 -> pyds-1.2.0-cp310-cp310-linux_x86_64.whl
+#   - PyGObject / GStreamer (apt: python3-gi python3-gst-1.0 gir1.2-gstreamer-1.0)
+#   - TensorRT (ships with DeepStream / apt libnvinfer*)
+ 
+numpy>=1.24
+cupy-cuda12x>=13.0              # use cupy-cuda11x instead only if your CUDA major version is 11
+opencv-python-headless>=4.8
+nvidia-ml-py>=12.535            # provides the `pynvml` module (GPU monitor)
 PyYAML>=5.4
+requests>=2.28                  # only used for --rutube-page
+nvidia-nvimgcodec-cu12>=0.4     # optional: GPU JPEG encode; script falls back to OpenCV if missing
+ 
+torch>=2.0
+torchvision>=0.15
+onnx>=1.14
+onnxruntime>=1.16               # optional: enables the PyTorch-vs-ONNX self

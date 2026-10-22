@@ -5,7 +5,9 @@ export_retinaface_onnx.py
 =========================
 
   pip install torch torchvision        (the CPU version is enough, this runs once)
-  python3 export_retinaface_onnx.py --weights Resnet50_Final.pth
+  python3 pytorch_to_onnx_retinaface.py --weights Resnet50_Final.pth
+  or
+  python3 pytorch_to_onnx_retinaface.py --weights Resnet50_Final.pth --width 1280 --height 736       (Recommended)
 
 
 Result: retinaface_r50_640x640.onnx
