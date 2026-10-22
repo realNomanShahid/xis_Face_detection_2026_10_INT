@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-retinaface_face_blur_gpu.py
+retinaface_face_detection.py
 ===========================
 Face detection (RetinaFace ResNet-50, ONNX -> TensorRT) + face blur for live streams or
 video files, using NVIDIA DeepStream for decode, batching, inference and encode.
@@ -84,6 +84,8 @@ import time
 import traceback
 from collections import OrderedDict, deque
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 
@@ -97,6 +99,68 @@ try:
     import pyds
 except ImportError as _e:  # pragma: no cover
     sys.exit(f"Missing Python package: {_e}\nSee the 'Setup' section at the top of this file.")
+
+
+# ----------------------------------------------------------------------------------
+# YAML configs (configs/*.yaml via src/config_loader.py) — defaults live here, not hardcoded
+# ----------------------------------------------------------------------------------
+def load_pipeline_cfg():
+    """Load all YAML sections. Returns {} if configs/ or PyYAML is missing."""
+    root = Path(__file__).resolve().parent
+    # allow script in project root or in src/
+    for base in (root, root.parent):
+        if str(base) not in sys.path:
+            sys.path.insert(0, str(base))
+        try:
+            from src.config_loader import load_all
+            cfg = load_all()
+            print(f"[config] loaded YAML from {base / 'configs'}")
+            return cfg
+        except Exception:
+            continue
+    try:
+        from src.config_loader import load_all
+        cfg = load_all()
+        print("[config] loaded YAML")
+        return cfg
+    except Exception as e:  # noqa: BLE001
+        print(f"[config] YAML not loaded ({e}); using CLI / built-in defaults only")
+        return {}
+
+
+def cfg_get(cfg, section, key, default=None):
+    sec = cfg.get(section) if isinstance(cfg, dict) else None
+    if not isinstance(sec, dict):
+        return default
+    val = sec.get(key, default)
+    return default if val is None else val
+
+
+def build_rtsp_from_camera(cam: dict):
+    """Build rtsp:// URI from configs/camera.yaml (password URL-encoded)."""
+    if not cam:
+        return None
+    if cam.get("rtsp_url"):
+        return str(cam["rtsp_url"])
+    ip = cam.get("ip")
+    path = cam.get("rtsp_path") or "/"
+    if not ip:
+        return None
+    port = int(cam.get("rtsp_port") or 554)
+    user = cam.get("onvif_user") or ""
+    password = cam.get("onvif_password")
+    env_name = cam.get("onvif_password_env") or "CAM_ONVIF_PASSWORD"
+    if not password:
+        password = os.environ.get(env_name) or ""
+    userinfo = ""
+    if user:
+        userinfo = quote(str(user), safe="")
+        if password:
+            userinfo += ":" + quote(str(password), safe="")
+        userinfo += "@"
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"rtsp://{userinfo}{ip}:{port}{path}"
 
 
 # ----------------------------------------------------------------------------------
@@ -1589,88 +1653,139 @@ class App:
 
 
 # ----------------------------------------------------------------------------------
+
 def parse_args():
-    p = argparse.ArgumentParser(description="DeepStream + TensorRT RetinaFace-R50 face blur (GPU post-processing)",
-                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--source", help="file path, rtsp://..., or http(s)://...m3u8")
-    p.add_argument("--rutube-page", help="Rutube page link; the HLS link is found automatically")
-    p.add_argument("--onnx", default="retinaface_r50_640x640.onnx",
+    """CLI overrides YAML defaults from configs/*.yaml (via src/config_loader.py)."""
+    cfg = load_pipeline_cfg()
+    det = cfg.get("detection") or {}
+    blur = cfg.get("blur") or {}
+    pipe = cfg.get("pipeline") or {}
+    cam = cfg.get("camera") or {}
+    enc = cfg.get("encode") or {}
+    prev = cfg.get("preview") or {}
+    logc = cfg.get("logging") or {}
+
+    p = argparse.ArgumentParser(
+        description="DeepStream + TensorRT RetinaFace-R50 face blur (GPU post-processing; defaults from configs/)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--source", default=cfg_get(cfg, "pipeline", "source"),
+                   help="file path, rtsp://..., or http(s)://...m3u8 (or camera.yaml if omitted)")
+    p.add_argument("--rutube-page", default=cfg_get(cfg, "pipeline", "rutube_page"),
+                   help="Rutube page link; the HLS link is found automatically")
+    p.add_argument("--onnx", default=str(det.get("onnx_path") or "retinaface_r50_1280x736.onnx"),
                    help="RetinaFace ONNX; nvinfer builds the TensorRT engine from it on first run")
-    p.add_argument("--engine", default="",
-                   help="TensorRT engine path (default: <onnx>_b1_gpu0_fp16.engine next to the ONNX). "
-                        "Built automatically if missing, reused if present.")
-    p.add_argument("--model-name", default="", help="name shown in the report (default: guessed from the file name)")
-    p.add_argument("--det-width", type=int, default=0,
-                   help="ONNX input width (0 = read it from the file name, e.g. ..._1280x736.onnx, else 640)")
-    p.add_argument("--det-height", type=int, default=0, help="ONNX input height (0 = same auto rule)")
-    p.add_argument("--conf", type=float, default=0.5, help="face score threshold (lower = fewer misses)")
-    p.add_argument("--nms", type=float, default=0.4)
-    p.add_argument("--pad", type=float, default=0.20, help="enlarge each face box by this fraction")
-    p.add_argument("--blur-frac", type=float, default=0.25,
+    p.add_argument("--engine", default=str(det.get("engine_path") or ""),
+                   help="TensorRT engine path (default from detection.yaml or <onnx>_b1_gpu0_fp16.engine)")
+    p.add_argument("--model-name", default=str(det.get("model_name") or ""),
+                   help="name shown in the report (default: guessed from the file name)")
+    p.add_argument("--det-width", type=int, default=int(det.get("det_width") or 0),
+                   help="ONNX input width (0 = read from file name)")
+    p.add_argument("--det-height", type=int, default=int(det.get("det_height") or 0),
+                   help="ONNX input height (0 = same auto rule)")
+    p.add_argument("--conf", type=float,
+                   default=float(det.get("conf") if det.get("conf") is not None else 0.15),
+                   help="face score threshold (lower = fewer misses)")
+    p.add_argument("--nms", type=float,
+                   default=float(det.get("nms") if det.get("nms") is not None else 0.4))
+    p.add_argument("--pad", type=float,
+                   default=float(blur.get("pad") if blur.get("pad") is not None else 0.20),
+                   help="enlarge each face box by this fraction")
+    p.add_argument("--blur-frac", type=float,
+                   default=float(blur.get("blur_frac") if blur.get("blur_frac") is not None else 0.25),
                    help="blur radius as a fraction of the face size (bigger = stronger)")
-    p.add_argument("--hold", type=int, default=5, help="keep last boxes this many frames if a face is missed")
-    p.add_argument("--output", default="output_blurred.mkv")
-    p.add_argument("--out-dir", default="logs",
+    p.add_argument("--hold", type=int,
+                   default=int(blur.get("hold_frames") if blur.get("hold_frames") is not None else 5),
+                   help="keep last boxes this many frames if a face is missed")
+    p.add_argument("--output", default=str(pipe.get("output") or "output_blurred.mkv"))
+    p.add_argument("--out-dir", default=str(pipe.get("out_dir") or "logs"),
                    help="folder where the video, logs, metrics and sample frames are saved")
-    p.add_argument("--codec", choices=["h264", "h265"], default="h264")
-    p.add_argument("--bitrate", type=int, default=8_000_000)
-    p.add_argument("--preview", action="store_true",
-                   help="open a small live window with the blurred video and a top-left overlay "
-                        "(Persons = faces in the current frame, FPS). Needs a desktop session.")
-    p.add_argument("--preview-size", default="1000x1000",
-                   help="maximum preview window size WIDTHxHEIGHT; the video keeps its shape and fits inside")
-    p.add_argument("--preview-fps", type=float, default=15,
-                   help="how many frames per second the preview window shows (does not affect the saved video)")
+    p.add_argument("--codec", choices=["h264", "h265"], default=str(enc.get("codec") or "h264"))
+    p.add_argument("--bitrate", type=int, default=int(enc.get("bitrate") or 8_000_000))
+    p.add_argument("--preview", action="store_true", default=bool(prev.get("enabled") or False),
+                   help="open a small live window with the blurred video and a top-left overlay")
+    p.add_argument("--no-preview", action="store_true", help="force preview off even if enabled in YAML")
+    pw = int(prev.get("max_width") or 1000)
+    ph = int(prev.get("max_height") or 1000)
+    p.add_argument("--preview-size", default=f"{pw}x{ph}",
+                   help="maximum preview window size WIDTHxHEIGHT")
+    p.add_argument("--preview-fps", type=float,
+                   default=float(prev.get("fps") if prev.get("fps") is not None else 15),
+                   help="preview refresh rate (does not affect saved video)")
     p.add_argument("--no-preview-boxes", action="store_true",
+                   default=not bool(prev.get("draw_boxes", True)),
                    help="do not draw the green detection boxes in the preview window")
-    p.add_argument("--out-fps", type=float, default=0,
-                   help="fixed frame rate of the saved video (steady timestamps). 0 = automatic: used for "
-                        "HLS / http(s) sources only, taken from the stream (fallback 25). Give a number to "
-                        "force it for any source type.")
-    p.add_argument("--no-retime", action="store_true",
-                   help="keep the original (arrival) timestamps in the saved video, even for HLS")
-    p.add_argument("--rtsp-protocol", choices=["tcp", "udp"], default="tcp",
-                   help="RTSP transport. TCP does not lose packets (recommended).")
-    p.add_argument("--latency", type=int, default=500,
-                   help="RTSP jitter buffer in ms (bigger = safer on a bad network, more delay)")
-    p.add_argument("--sample-dir", default="sample_frames")
-    p.add_argument("--save-samples", action="store_true",
-                   help="save before/after sample frames (every 100 frames unless --sample-every is given). "
-                        "Without --save-samples / --sample-every nothing is stored.")
-    p.add_argument("--sample-every", type=int, default=0,
+    p.add_argument("--out-fps", type=float,
+                   default=float(pipe.get("out_fps") if pipe.get("out_fps") is not None else 0),
+                   help="fixed frame rate of the saved video (0 = automatic for HLS)")
+    p.add_argument("--no-retime", action="store_true", default=bool(pipe.get("no_retime") or False),
+                   help="keep original timestamps even for HLS")
+    p.add_argument("--rtsp-protocol", choices=["tcp", "udp"],
+                   default=str(cam.get("rtsp_protocol") or "tcp"),
+                   help="RTSP transport")
+    p.add_argument("--latency", type=int,
+                   default=int(cam.get("latency_ms") if cam.get("latency_ms") is not None else 500),
+                   help="RTSP jitter buffer in ms")
+    p.add_argument("--sample-dir", default=str(logc.get("sample_dir") or "sample_frames"))
+    p.add_argument("--save-samples", action="store_true", default=bool(logc.get("save_samples") or False),
+                   help="save before/after sample frames")
+    p.add_argument("--sample-every", type=int, default=int(logc.get("sample_every") or 0),
                    help="save a before/after image every N frames (0 = off)")
-    p.add_argument("--detected-dir", default="detected_instances",
-                   help="folder (under --out-dir) for every frame where a face was detected and blurred")
+    p.add_argument("--detected-dir", default=str(logc.get("detected_dir") or "detected_instances"),
+                   help="folder for frames where a face was detected and blurred")
     p.add_argument("--no-save-detections", action="store_true",
-                   help="do not save per-detection images into detected_instances/")
+                   default=not bool(logc.get("save_detections", True)),
+                   help="do not save per-detection images")
     p.add_argument("--no-gpu-jpeg", action="store_true",
-                   help="do not use the GPU JPEG encoder (nvImageCodec); encode with OpenCV in a background thread")
-    p.add_argument("--log-dir", default="",
-                   help="folder for detection_logs.jsonl and privacy_audit.jsonl (default: next to --metrics-json)")
-    p.add_argument("--no-logs", action="store_true", help="do not write the two .jsonl log files")
-    p.add_argument("--metrics-json", default="metrics.json")
-    p.add_argument("--max-seconds", type=float, default=0, help="stop after N seconds (0 = until the end)")
-    p.add_argument("--warmup", type=int, default=30, help="frames excluded from the timings")
-    p.add_argument("--width", type=int, default=1920, help="nvstreammux width (match your source)")
-    p.add_argument("--height", type=int, default=1080, help="nvstreammux height (match your source)")
-    p.add_argument("--max-height", type=int, default=720, help="stream quality cap for --rutube-page")
-    p.add_argument("--leaky", action="store_true",
-                   help="live: drop old frames instead of queueing when slow "
-                        "(NOT recommended for HLS: it drops frames during bursts)")
-    p.add_argument("--gpu", type=int, default=0)
+                   default=bool(logc.get("no_gpu_jpeg") or False),
+                   help="do not use GPU JPEG encoder (nvImageCodec); encode with OpenCV in a background thread")
+    p.add_argument("--log-dir", default=str(logc.get("log_dir") or ""),
+                   help="folder for detection_logs.jsonl and privacy_audit.jsonl")
+    p.add_argument("--no-logs", action="store_true",
+                   default=not bool(logc.get("write_jsonl_logs", True)),
+                   help="do not write the two .jsonl log files")
+    p.add_argument("--metrics-json", default=str(logc.get("metrics_json") or "metrics.json"))
+    p.add_argument("--max-seconds", type=float,
+                   default=float(pipe.get("max_seconds") if pipe.get("max_seconds") is not None else 0),
+                   help="stop after N seconds (0 = until the end)")
+    p.add_argument("--warmup", type=int,
+                   default=int(pipe.get("warmup_frames") if pipe.get("warmup_frames") is not None else 30),
+                   help="frames excluded from the timings")
+    p.add_argument("--width", type=int, default=int(pipe.get("width") or 1536),
+                   help="nvstreammux width (match your source)")
+    p.add_argument("--height", type=int, default=int(pipe.get("height") or 864),
+                   help="nvstreammux height (match your source)")
+    p.add_argument("--max-height", type=int,
+                   default=int(pipe.get("max_height_rutube") if pipe.get("max_height_rutube") is not None else 720),
+                   help="stream quality cap for --rutube-page")
+    p.add_argument("--leaky", action="store_true", default=bool(pipe.get("leaky") or False),
+                   help="live: drop old frames instead of queueing when slow")
+    p.add_argument("--gpu", type=int, default=int(pipe.get("gpu_id") if pipe.get("gpu_id") is not None else 0))
     a = p.parse_args()
+
+    if a.no_preview:
+        a.preview = False
+
     if a.rutube_page:
         a.source = resolve_rutube(a.rutube_page, a.max_height)
         print("Rutube HLS link:", a.source[:100], "...")
         with open("rutube_link.txt", "w") as _f:
             _f.write(a.source)
         print("(full link saved in rutube_link.txt)")
+
     if not a.source:
-        p.error("give --source or --rutube-page")
+        built = build_rtsp_from_camera(cam)
+        if built:
+            a.source = built
+            print("[config] source from camera.yaml")
+        else:
+            p.error("give --source or --rutube-page, or set camera/source in configs/")
+
     ms = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", a.preview_size)
     if not ms:
         p.error("--preview-size must look like 1000x1000")
     a.preview_w, a.preview_h = int(ms.group(1)), int(ms.group(2))
+
     if not (a.det_width and a.det_height):
         mm = re.search(r"(\d+)x(\d+)", os.path.basename(a.onnx))
         a.det_width = a.det_width or (int(mm.group(1)) if mm else 640)
@@ -1681,7 +1796,7 @@ def parse_args():
     a.model_name = a.model_name or guess_model_name(a.onnx, a.engine)
     if not os.path.exists(a.engine) and not os.path.exists(a.onnx):
         p.error(f"neither the engine ({a.engine}) nor the ONNX ({a.onnx}) was found")
-        # put everything in one folder (default: logs/)
+
     os.makedirs(a.out_dir, exist_ok=True)
 
     def _in_dir(path):
@@ -1698,6 +1813,7 @@ def parse_args():
         os.makedirs(a.sample_dir, exist_ok=True)
     if not a.no_save_detections:
         os.makedirs(a.detected_dir, exist_ok=True)
+    a.cfg = cfg
     return a
 
 
