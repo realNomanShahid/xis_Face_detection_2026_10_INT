@@ -2,6 +2,6 @@ numpy
 cupy-cuda12x
 opencv-python-headless
 nvidia-ml-py
+nvidia-nvimgcodec-cu12
 requests
 PyYAML>=5.4
-nvidia-nvimgcodec-cu12
