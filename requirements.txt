@@ -4,3 +4,4 @@ opencv-python-headless
 nvidia-ml-py
 requests
 PyYAML>=5.4
+nvidia-nvimgcodec-cu12

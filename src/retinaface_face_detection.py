@@ -603,7 +603,12 @@ class JpegSaver:
         try:
             from nvidia import nvimgcodec
             enc = nvimgcodec.Encoder()
-            params = nvimgcodec.EncodeParams(quality=self.quality)
+            try:
+              params = nvimgcodec.EncodeParams(
+                   quality_type=nvimgcodec.QualityType.QUALITY,   
+                   quality_value=float(self.quality))
+            except TypeError:                                       
+              params = nvimgcodec.EncodeParams(quality=self.quality)
             red = cp.zeros((16, 16, 3), dtype=cp.uint8)
             red[:, :, 0] = 255                                       # pure RED in RGB order
             data = self._encode(enc, nvimgcodec, params, red)
