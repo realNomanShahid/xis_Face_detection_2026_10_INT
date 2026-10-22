@@ -23,6 +23,7 @@ face/
 
 How to run after install → [HOW_TO_RUN.md](HOW_TO_RUN.md)
 
+For exact version installation read this → [TESTED_ENVIRONMENT.md](TESTED_ENVIRONMENT) 
 ---
 
 ## 1. System Requirements

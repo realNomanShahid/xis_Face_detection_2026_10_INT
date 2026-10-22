@@ -50,9 +50,9 @@ Also installed but **not used** by DeepStream 7.1: `libnvinfer11` / `libnvonnxpa
 | PyYAML | 6.0.3 |
 | requests | 2.34.2 |
 
-`pip check` reported no conflicts. For the one-time ONNX export only (not needed to run): `torch`, `torchvision`, `onnx`, `onnxruntime`, see `requirements-export.txt`.
+`pip check` reported no conflicts. For the one-time ONNX export only (not needed to run): `torch`, `torchvision`, `onnx`, `onnxruntime`, see `requirements.txt`.
 
-Install with `pip install -r requirements.txt`. Exact versions above are in `requirements-lock.txt`.
+Install with `pip install -r requirements.txt`. Exact versions above are in `requirements.lock`.
 
 ## 4. Environment variables
 
