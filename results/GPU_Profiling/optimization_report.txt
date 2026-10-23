@@ -1,0 +1,313 @@
+========================================================================================================
+ OPTIMIZATION & RESOURCE REPORT  (CPU / GPU usage, function map, workload + code split)
+========================================================================================================
+ Generated   : 2026-10-23 09:35:53 CEST
+ Script      : run.py
+ Source      : rtsp://dev_use:Pass123%23@10.11.4.254:554/rtsp_tunnel?p=1&line=1&inst=1&vcd=2  (live)
+ Model       : RetinaFace-R50  input 1280x736  conf 0.15  NMS 0.4  (TensorRT FP16, batch 1)
+ Frames      : 5058 processed (30 warm-up frames excluded from timings), run time 169.1 s
+ Host        : Intel(R) Core(TM) i7-14700K | 28 logical cores | RAM 31 GB | Linux-6.8.0-138-generic-x86_64-with-glibc2.35
+ GPU         : NVIDIA GeForce RTX 5080 | 16303 MB VRAM | driver 595.99.02 | CUDA runtime 12090 | CuPy 14.2.0
+ Settings    : save-detections=ON  logs=ON  preview=ON (DeepStream GPU branch)  JPEG=GPU (nvJPEG via nvImageCodec)
+ Profiling   : function-level timing ON; resource sampling every 0.50 s (339 samples)
+ How to read : section 1 = headline numbers, 2 = CPU/GPU usage over time, 3 = which function runs where,
+               4 = workload split (GPU % + CPU % = 100), 5 = code split (GPU % + CPU % = 100),
+               6 = CPU time accounting, 7 = bottlenecks and hints, 8 = definitions and caveats.
+
+========================================================================================================
+ 1. HEADLINE NUMBERS (the metrics to watch while optimizing)
+========================================================================================================
+ THROUGHPUT   steady-state FPS 30.0 | whole-run FPS 30.1 | estimated max FPS 518.2 (limited by detect (nvinfer)) | headroom 17.3x
+              frames at mux / processed / encoded: 5058 / 5058 / 5058 | frames lost 0
+ LATENCY      end-to-end mux->file ms: mean 6.4  p50 6.0  p95 7.9  max 19.9
+              frame interval ms:      mean 33.3  p50 33.4  p95 36.4  max 133.8
+ PROBE THREAD per-frame wall 1.56 ms (CPU 1.50 ms) -> serial limit 643 FPS | busy 5 % of the time at the current FPS
+ GPU          busy avg 6 % / peak 8 % | mem-ctrl avg 3 % | NVENC 2 % | NVDEC 2 %
+              VRAM peak 4956 MB of 16303 | power avg 75 W | SM clock avg 2764 MHz | energy per frame 2.493 J
+ CPU          this process 0.16 cores avg (0.6 % of the machine) | system CPU avg 2 % | RAM peak 1486 MB | FPS per CPU core 189
+ WORKLOAD     GPU 71.2 %  /  CPU 28.8 %   (measured busy time per frame, section 4)
+              intern's own code only (without DeepStream stages: TensorRT, NVENC, preview): GPU 41.2 % / CPU 58.8 %
+ CODE         GPU 9.8 %  /  CPU 90.2 %   (executable lines of this file, section 5)
+ HOST<->GPU   upload of model outputs 906 KB/frame (27 MB/s) | control readback 28 bytes/frame
+ DETECTION    faces/frame avg 0.25 / max 2 | frames with 0 faces 78.4 % | held frames 128 | privacy audit PASS
+
+========================================================================================================
+ 2. CPU AND GPU USAGE: AT START, STEADY STATE, PEAK, AT FINISH
+========================================================================================================
+ Phases (approx.): init (CUDA kernel build, model setup) 0.0 s | startup (engine load + warm-up frames) 1.5 s | steady state 168.1 s
+ 'At start' = first sample ~0.25 s after the program began. 'Steady' = after the warm-up frames.
+ NOTE: on the first run the startup phase includes the TensorRT engine build, which is CPU+GPU heavy.
+
+ Metric                                 At start   Steady avg  Steady peak  Overall avg Overall peak    At finish
+--------------------------------------------------------------------------------------------------------
+ System CPU, all cores %                       5            2            7            2            7            2
+ This process CPU, cores                    0.79         0.16         0.28         0.16         0.79         0.28
+ This process CPU, % of machine              2.8          0.6          1.0          0.6          2.8          1.0
+ Process RAM (RSS) MB                        883         1483         1486         1481         1486         1199
+ GPU busy % (NVML)                             1            6            8            6           23            6
+ GPU memory-controller busy %                  0            3            3            3            8            2
+ NVENC utilisation %                           1            2            4            2            5            2
+ NVDEC utilisation %                           0            2            2            2            5            2
+ GPU memory used MB                         3936         4947         4956         4943         4956         4098
+ GPU power W                                  56           75           78           75           78           75
+ GPU temperature C                            37           41           45           40           45           42
+ GPU SM clock MHz                           2715         2764         2782         2764         2782         2767
+ (full time series: optimization_report_timeline.csv)
+
+========================================================================================================
+ 3. WHICH FUNCTION RUNS ON THE GPU AND WHICH ON THE CPU
+========================================================================================================
+ 3a. MEASURED STAGES of the per-frame path (steady state, milliseconds per frame)
+     GPU ms = CUDA-event time on the GPU | CPU ms = thread CPU time | WAIT ms = host blocked waiting for the GPU
+--------------------------------------------------------------------------------------------------------
+ Stage                                       Function                  On    GPU ms/f CPU ms/f WAIT ms/f
+--------------------------------------------------------------------------------------------------------
+ nvinfer: TensorRT inference (probe-to-probe pipeline: nvinfer         GPU      1.930    0.000     0.000
+ NVENC: video encode (probe-to-probe)        pipeline: nvv4l2h264enc   GPU      0.804    0.000     0.000
+ ROI build + compaction (CuPy ops)           RetinaFaceDecoder.process GPU      0.547    0.000     0.000
+ top-K sort + gather (CuPy argsort)          RetinaFaceDecoder.process GPU      0.230    0.000     0.000
+ confidence stats + pack (CuPy ops)          RetinaFaceDecoder.process GPU      0.173    0.000     0.000
+ preview branch: nvvideoconvert + nvdsosd (p pipeline: preview branch  GPU      0.080    0.000     0.000
+ upload loc+conf (H2D copy + fp16->fp32)     App._to_gpu_f32           GPU      0.073    0.000     0.000
+ JPEG encode (nvJPEG, host wall time)        JpegSaver._encode         GPU      0.016    0.055     0.000
+ rf_decode kernel (softmax + box decode)     RetinaFaceDecoder.process GPU      0.026    0.000     0.000
+ nms_reduce kernel (greedy keep)             RetinaFaceDecoder.process GPU      0.019    0.000     0.000
+ nms_mask kernel (pairwise IoU)              RetinaFaceDecoder.process GPU      0.011    0.000     0.000
+ copy blurred frame RGB for JPEG             App._process_impl         GPU      0.008    0.000     0.000
+ blur_h kernel (horizontal pass)             App._blur                 GPU      0.002    0.000     0.000
+ blur_v kernel (vertical pass)               App._blur                 GPU      0.002    0.000     0.000
+ host: enqueue GPU work (launch overhead)    all GPU stages            CPU      0.000    1.110     0.000
+ read tensor meta + wrap GPU frame           App._tensors, App._gpu_fr CPU      0.000    0.156     0.000
+ python glue in the probe (hold logic, bookk App._process_impl         CPU      0.000    0.084     0.000
+ write detection + audit logs                App._log_frame            CPU      0.000    0.047     0.000
+ JPEG file write (background thread)         JpegSaver._run            CPU      0.000    0.027     0.000
+ probe callback: p_mux_out                   App.p_mux_out             CPU      0.000    0.022     0.000
+ probe callback: p_det_out                   App.p_det_out             CPU      0.000    0.018     0.000
+ probe callback: p_det_in                    App.p_det_in              CPU      0.000    0.014     0.000
+ probe callback: p_enc_out                   App.p_enc_out             CPU      0.000    0.014     0.000
+ preview: read boxes + build OSD metadata    GpuPreview.attach_osd     CPU      0.000    0.013     0.000
+ probe callback: p_enc_in                    App.p_enc_in              CPU      0.000    0.010     0.000
+ probe callback: p_pv_in                     App.p_pv_in               CPU      0.000    0.006     0.000
+ probe callback: p_pv_out                    App.p_pv_out              CPU      0.000    0.005     0.000
+ probe callback: p_pv_gate                   App.p_pv_gate             CPU      0.000    0.002     0.000
+ wait: readback of 7 control numbers         RetinaFaceDecoder.process WAIT     0.000    0.000     0.059
+ wait: stream sync after blur                App._process_impl         WAIT     0.000    0.000     0.004
+--------------------------------------------------------------------------------------------------------
+ TOTAL                                                                          3.921    1.583     0.064
+ Not timed one by one (hardware blocks inside DeepStream): NVDEC decode, nvstreammux, nvvideoconvert x2,
+ and the EGL window render of the preview sink. Their load is visible in the NVDEC % / GPU busy % rows of section 2.
+
+ 3b. PIPELINE ELEMENTS (DeepStream / GStreamer plugins, not Python code)
+--------------------------------------------------------------------------------------------------------
+ nvurisrcbin (video decode)                    GPU (NVDEC hardware); network/demux part on CPU (light)
+ nvstreammux (batching)                        GPU
+ nvinfer (resize + normalise + TensorRT)       GPU (TensorRT); output tensors are copied to host by nvinfer
+ nvvideoconvert x2 (RGBA / NV12)               GPU
+ nvv4l2h264enc / nvv4l2h265enc                 GPU (NVENC hardware)
+ preview branch: tee + nvvideoconvert (scale)  GPU (only with --preview)
+ preview branch: nvdsosd (boxes + FPS text)    GPU (only with --preview)
+ preview branch: nveglglessink (window)        GPU / EGL (only with --preview)
+ h264parse, matroskamux/qtmux, filesink        CPU (light)
+ GStreamer queues / streaming threads          CPU (light)
+
+ 3c. EVERY FUNCTION IN THIS FILE (static) - where its work executes
+     'GPU' = the work of the function runs on the GPU (the Python lines inside only enqueue it).
+--------------------------------------------------------------------------------------------------------
+ Function                                                  Runs on       Lines  % of code
+--------------------------------------------------------------------------------------------------------
+ CUDA kernels (CUDA_SRC)                                   GPU-KERNEL      126       5.5%
+ RetinaFaceDecoder.process_gpu                             GPU              67       2.9%
+ App._blur                                                 GPU              11       0.5%
+ App._gpu_resize                                           GPU               8       0.4%
+ RetinaFaceDecoder.warm                                    GPU               5       0.2%
+ App._to_gpu_f32                                           GPU               4       0.2%
+ JpegSaver._encode                                         GPU               3       0.1%
+ build_optimization_report                                 CPU             342      15.0%
+ App.report                                                CPU             169       7.4%
+ App.build                                                 CPU             133       5.8%
+ App._process_impl                                         CPU             127       5.6%
+ parse_args                                                CPU             119       5.2%
+ App.__init__                                              CPU              83       3.6%
+ (module level: imports, constants, entry point)           CPU              56       2.5%
+ compute_code_split                                        CPU              55       2.4%
+ resolve_rutube                                            CPU              48       2.1%
+ GpuPreview.build                                          CPU              42       1.8%
+ App._log_frame                                            CPU              39       1.7%
+ ResourceMonitor._gpu_sample                               CPU              32       1.4%
+ ResourceMonitor.__init__                                  CPU              27       1.2%
+ App.p_retime                                              CPU              27       1.2%
+ App._tensors                                              CPU              27       1.2%
+ App.run                                                   CPU              27       1.2%
+ RetinaFaceDecoder.__init__                                CPU              26       1.1%
+ App.p_main                                                CPU              26       1.1%
+ RetinaFaceDecoder.build_plan                              CPU              25       1.1%
+ GpuPreview.attach_osd                                     CPU              25       1.1%
+ ResourceMonitor.run                                       CPU              24       1.1%
+ JpegSaver._init_gpu                                       CPU              20       0.9%
+ JpegSaver.save                                            CPU              19       0.8%
+ App.write_nvinfer_config                                  CPU              19       0.8%
+ App.on_bus                                                CPU              19       0.8%
+ JpegSaver._run                                            CPU              18       0.8%
+ GpuMonitor.__init__                                       CPU              18       0.8%
+ timed                                                     CPU              15       0.7%
+ GpuMonitor.run                                            CPU              15       0.7%
+ App._process                                              CPU              14       0.6%
+ GpuPreview.__init__                                       CPU              13       0.6%
+ GpuPreview.preflight                                      CPU              13       0.6%
+ GpuPreview.remove_branch                                  CPU              13       0.6%
+ Profiler.add                                              CPU              12       0.5%
+ Profiler.flush_gpu                                        CPU              12       0.5%
+ JpegSaver.__init__                                        CPU              12       0.5%
+ App.p_enc_out                                             CPU              12       0.5%
+ App.request_stop                                          CPU              12       0.5%
+ App.p_det_out                                             CPU              11       0.5%
+ App.open_logs                                             CPU              11       0.5%
+ App.audit_summary                                         CPU              11       0.5%
+ ResourceMonitor._rss_mb                                   CPU              10       0.4%
+ ResourceMonitor.write_csv                                 CPU              10       0.4%
+ GpuPreview.fit                                            CPU              10       0.4%
+ _cpu_model                                                CPU               9       0.4%
+ _ram_total_gb                                             CPU               9       0.4%
+ App._drop_preview_branch                                  CPU               9       0.4%
+ App._gpu_frame                                            CPU               9       0.4%
+ App.close_logs                                            CPU               9       0.4%
+ guess_model_name                                          CPU               8       0.4%
+ ResourceMonitor._sys_cpu_times                            CPU               8       0.4%
+ App.p_pv_out                                              CPU               8       0.4%
+ setp                                                      CPU               7       0.3%
+ to_uri                                                    CPU               7       0.3%
+ Profiler.__init__                                         CPU               7       0.3%
+ ResourceMonitor.stat                                      CPU               7       0.3%
+ GpuPreview.set_frame_size                                 CPU               7       0.3%
+ App.p_mux_out                                             CPU               7       0.3%
+ _GpuSpan.__enter__                                        CPU               6       0.3%
+ _GpuSpan.__exit__                                         CPU               6       0.3%
+ Stat.summary                                              CPU               6       0.3%
+ GpuPreview.owns                                           CPU               6       0.3%
+ App.p_det_in                                              CPU               6       0.3%
+ App.p_enc_in                                              CPU               6       0.3%
+ App.p_pv_in                                               CPU               6       0.3%
+ _CpuSpan.__exit__                                         CPU               5       0.2%
+ RetinaFaceDecoder (class header / constants)              CPU               5       0.2%
+ GpuPreview.due                                            CPU               5       0.2%
+ App._stamp                                                CPU               5       0.2%
+ App.p_pv_gate                                             CPU               5       0.2%
+ _CpuSpan.__enter__                                        CPU               4       0.2%
+ Stat.add                                                  CPU               4       0.2%
+ App._phase                                                CPU               4       0.2%
+ App._lap                                                  CPU               4       0.2%
+ App._force_quit                                           CPU               4       0.2%
+ ResourceMonitor (class header / constants)                CPU               3       0.1%
+ ResourceMonitor.phase_seconds                             CPU               3       0.1%
+ JpegSaver.close                                           CPU               3       0.1%
+ GpuPreview.caps_string                                    CPU               3       0.1%
+ App._host_f32                                             CPU               3       0.1%
+ App._timer_stop                                           CPU               3       0.1%
+ App._sigint                                               CPU               3       0.1%
+ _NullSpan (class header / constants)                      CPU               2       0.1%
+ _NullSpan.__enter__                                       CPU               2       0.1%
+ _NullSpan.__exit__                                        CPU               2       0.1%
+ _CpuSpan (class header / constants)                       CPU               2       0.1%
+ _CpuSpan.__init__                                         CPU               2       0.1%
+ _GpuSpan (class header / constants)                       CPU               2       0.1%
+ _GpuSpan.__init__                                         CPU               2       0.1%
+ Profiler._event                                           CPU               2       0.1%
+ Profiler.cpu                                              CPU               2       0.1%
+ Profiler.wait                                             CPU               2       0.1%
+ Profiler.gpu                                              CPU               2       0.1%
+ ResourceMonitor.stop                                      CPU               2       0.1%
+ Stat.__init__                                             CPU               2       0.1%
+ GpuMonitor.stop                                           CPU               2       0.1%
+ GpuPreview (class header / constants)                     CPU               2       0.1%
+ GpuPreview.close                                          CPU               2       0.1%
+ Profiler (class header / constants)                       CPU               1       0.0%
+ JpegSaver (class header / constants)                      CPU               1       0.0%
+ Stat (class header / constants)                           CPU               1       0.0%
+ GpuMonitor (class header / constants)                     CPU               1       0.0%
+ App (class header / constants)                            CPU               1       0.0%
+
+========================================================================================================
+ 4. WORKLOAD SPLIT: HOW MUCH OF THE WORK RUNS ON THE GPU AND ON THE CPU (= 100 %)
+========================================================================================================
+ Basis: measured busy time per frame in steady state = 5.504 ms  (GPU 3.921 ms + CPU 1.583 ms)
+
+   GPU :   71.2 %     3.921 ms/frame
+           of which DeepStream GPU stages (TensorRT, NVENC, preview)  51.1 %  (2.813 ms)
+           of which this program's CUDA kernels / copies / nvJPEG  20.1 %  (1.108 ms)
+   CPU :   28.8 %     1.583 ms/frame
+   ----------------------------
+   TOTAL 100.0 %
+
+   Host waiting for the GPU (counted in neither): 0.064 ms/frame
+   Only this program's own code (DeepStream stages excluded): GPU 41.2 % / CPU 58.8 %
+
+   Live preview (DeepStream branch): GPU 0.080 ms/frame  (nvvideoconvert + nvdsosd; the EGL render in the sink is not timed)
+                                     CPU 0.026 ms/frame  (box readback + OSD metadata + gate/stat probes)
+   Before, the preview was OpenCV: a full-frame GPU->CPU copy, resize and drawing on the CPU. That work now runs on
+   the GPU, so the GPU share above is higher and the CPU share lower than with the OpenCV preview. Pixels no longer
+   cross to the CPU; only the face boxes (N x 5 floats) do, to build the OSD metadata.
+ Caveats: stages overlap in time (the pipeline is multi-threaded), so this is a split of work, not of wall-clock
+          latency. NVDEC, nvstreammux and nvvideoconvert are GPU work too but are not in this total.
+
+========================================================================================================
+ 5. CODE SPLIT: HOW MUCH OF THE CODE RUNS ON THE GPU AND ON THE CPU (= 100 %)
+========================================================================================================
+ Basis: 2278 executable lines in this file (blank lines, comments and docstrings not counted)
+
+   GPU :    9.8 %   (224 lines)
+           CUDA kernels (CUDA_SRC)                  5.5 %  (126 lines)
+           Python functions whose work is on GPU    4.3 %  (98 lines)
+   CPU :   90.2 %   (2054 lines)   argument parsing, GStreamer pipeline, probes, logging, report, preview, ...
+   ----------------------------
+   TOTAL 100.0 %
+
+ The preview window is rendered by DeepStream plugins (GPU); only its control code is Python, so it counts as CPU lines.
+ Why this is not the same as section 4: most lines of a DeepStream program are setup, plumbing and reporting
+ that run once or cheaply; the few GPU lines (kernels) do almost all of the compute. Use section 4 to judge
+ the compute split and this section only to judge how much of the code base is GPU code.
+
+========================================================================================================
+ 6. WHERE THE CPU TIME GOES (steady state)
+========================================================================================================
+ Process CPU time in the measured window : 26.56 s  = 0.16 cores on average
+   attributed to Python stages above      :    7.96 s   30.0 %
+   spent spinning while waiting for GPU   :    0.19 s    0.7 %
+   not attributed (GStreamer threads, CUDA/NVML drivers, DeepStream plugins, monitor threads): 18.41 s   69.3 %
+
+========================================================================================================
+ 7. BOTTLENECKS AND OPTIMIZATION HINTS (generated from the numbers above)
+========================================================================================================
+ Top 5 cost items (ms per frame, GPU + CPU):
+     1.930 ms  GPU  nvinfer: TensorRT inference (probe-to-probe)
+     1.110 ms  CPU  host: enqueue GPU work (launch overhead)
+     0.804 ms  GPU  NVENC: video encode (probe-to-probe)
+     0.547 ms  GPU  ROI build + compaction (CuPy ops)
+     0.230 ms  GPU  top-K sort + gather (CuPy argsort)
+
+ 1. Live source: FPS equals what the camera/stream delivers; the pipeline has spare capacity (headroom 17.3x). Use a file source to measure maximum throughput.
+ 2. TensorRT inference is the slowest stage: smaller input size, INT8 calibration or a lighter backbone (RetinaFace-ResNet18 / MobileNet) would speed it up.
+ 3. Model outputs make a round trip GPU -> host (done inside nvinfer) -> GPU: 906 KB per frame. Removing it needs a custom parser or device-side tensor pointers.
+
+========================================================================================================
+ 8. METRIC DEFINITIONS AND CAVEATS
+========================================================================================================
+ GPU busy % (NVML)      share of each sample period in which at least one kernel was running. It is NOT SM occupancy:
+                        100 % can still be a poorly filled GPU, and a low value means the GPU is waiting for work.
+ GPU ms (stages)        CUDA events recorded before/after each stage on the GPU timeline: kernel time plus tiny gaps.
+ CPU ms (stages)        time.thread_time(): CPU seconds used by that thread. Blocked/sleeping time is excluded.
+ WAIT ms                wall time the host thread was blocked on the GPU (readback, stream sync). Not CPU work, not GPU work.
+ nvinfer / NVENC ms     probe-to-probe wall time inside the pipeline; includes internal queueing and their own threads.
+ nvJPEG encode          measured as host wall time of the call; split into GPU part (wall - CPU) and CPU part.
+ preview branch ms      probe-to-probe wall time of nvvideoconvert + nvdsosd for the frames shown; spread over all frames
+                        because the preview runs at --preview-fps only. The EGL render inside the sink is not included.
+ Workload split         busy time per frame, steady state only. GPU % + CPU % = 100 %; WAIT is reported separately.
+ Code split             executable lines per function (ast). A line count is not a compute share (see section 5).
+ Estimated max FPS      1000 / slowest stage mean (theoretical, assumes perfect overlap). Steady-state FPS is the measured one.
+ Probe thread limit     the Python probe handles one frame at a time; 1000 / its per-frame wall time is a hard FPS ceiling.
+ Profiling overhead     CUDA events and timers add a small cost per frame (typically a few percent at several hundred FPS).
+                        Use --no-profile for a pure speed benchmark; resource sampling alone is negligible.
+ Sampling               CPU/GPU usage is sampled every --prof-period seconds; short spikes between samples are not seen.
+
+========================================================================================================
+ END OF REPORT
+========================================================================================================
