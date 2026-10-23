@@ -267,7 +267,9 @@ face/
 ├── src/
 │   ├── config_loader.py              # load configs/*.yaml
 │   ├── retinaface_face_detection.py  # main DeepStream pipeline
-│   └── pytorch_to_onnx_retinaface.py # .pth → ONNX
+│   ├── pytorch_to_onnx_retinaface.py # .pth → ONNX
+│   └── GPU_Profilig/
+│       └── retinaface_face_blur_gpu_profiling.py  # same pipeline + CPU/GPU profiling report (no YAML)
 │
 ├── docs/
 │   ├── RetinaFace-R50_Performance_Report.pdf
@@ -282,7 +284,7 @@ face/
 │       ├── RESULTS.md
 │       ├── HIGH_FPS_RTSP.md
 │       └── Soak_Test.md
-│
+│       └── GPU_PROFILING.md
 ├── results/
 │   └── RetinaFace_resnet50/          # example metrics + samples
 │       ├── metrics.json
