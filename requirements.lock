@@ -1,0 +1,17 @@
+certifi==2026.7.22
+charset-normalizer==3.5.2
+cuda-pathfinder==1.8.3
+cupy-cuda12x==14.2.0
+idna==3.20
+numpy==2.2.6
+nvidia-ml-py==13.615.71
+nvidia-nvimgcodec-cu12==0.9.0.20
+opencv-python-headless==5.0.0.93
+packaging==26.3
+pycairo==1.29.1
+pyds @ file:///home/xisai-s1/Workspace/NomanShahid/Face_detection/pyds-1.2.0-cp310-cp310-linux_x86_64.whl#sha256=f2b7585a4d09416119cf59b8eae8d1008654315838b55319a3c795c9e425888c
+PyGObject==3.54.5
+PyYAML==6.0.3
+requests==2.34.2
+urllib3==2.8.0
+yt-dlp==2026.8.19

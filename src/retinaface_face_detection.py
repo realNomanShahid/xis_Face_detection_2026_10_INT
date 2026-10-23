@@ -16,12 +16,12 @@ JPEG saving of detected frames).
     -> queue -> nvvideoconvert (to RGBA)                                            GPU
     -> [python probe]                                                               
          upload raw model outputs (loc/conf) -> GPU                                 
-         GPU decode kernel  : softmax, box decode, clip, size filter                GPU  (was numpy)
-         GPU top-K sort + GPU bitmask NMS (CUDA kernels)                            GPU  (was numpy loop)
-         GPU ROI building + compaction                                              GPU  (was numpy)
+         GPU decode kernel  : softmax, box decode, clip, size filter                GPU  
+         GPU top-K sort + GPU bitmask NMS (CUDA kernels)                            GPU  
+         GPU ROI building + compaction                                              GPU  
          1 tiny readback (7 numbers: counts, grid size, confidence stats)           control only
-         CUDA blur kernels (in place on the NVMM surface)                           GPU  (unchanged)
-         JPEG of detected frames: nvJPEG encode on GPU (CPU fallback if missing)    GPU  (was cv2 on CPU)
+         CUDA blur kernels (in place on the NVMM surface)                           GPU  
+         JPEG of detected frames: nvJPEG encode on GPU (CPU fallback if missing)    GPU  
     -> queue -> nvvideoconvert (to NV12)                                            GPU
     -> NVENC encoder -> parser -> mp4 / mkv file                                    GPU (NVENC)
 
@@ -716,20 +716,40 @@ class GpuMonitor(threading.Thread):
 
 
 # ----------------------------------------------------------------------------------
-# live preview window (a second, tiny GStreamer pipeline: appsrc -> videoconvert -> X window)
-# It is fed from the probe, throttled, and can never block or crash the main pipeline.
-# (Display needs host pixels, so this stays on the CPU. It is optional and off by default.)
+# live preview ON THE GPU: a DeepStream branch of the main pipeline (no OpenCV, no appsrc)
 # ----------------------------------------------------------------------------------
-class Preview:
-    def __init__(self, max_w, max_h, max_fps, draw_boxes):
+class GpuPreview:
+    """Live preview that stays on the GPU.
+
+      ... conv1 -> caps1 (RGBA, already blurred by the probe) -> tee -+-> q3 -> conv2 -> NVENC -> file  (unchanged)
+                                                                      |
+                                                                      +-> queue (leaky) -> nvvideoconvert (GPU scale)
+                                                                          -> nvdsosd (GPU draws boxes + FPS text)
+                                                                          -> nveglglessink (GPU / EGL window)
+
+    * Pixels never leave the GPU. Only the face boxes (N x 5 floats) are read back to build the
+      on-screen-display metadata, which is control data.
+    * nvvideoconvert always scales into a SEPARATE surface. nvdsosd draws in place, and tee shares
+      the buffer between both branches, so without this copy the boxes would be burned into the
+      saved video. The saved video is never touched by the preview.
+    * A gate probe on the preview branch drops every frame above --preview-fps before it can cost
+      any GPU work, and the leaky queue means the preview can never slow the main pipeline down.
+    * If the window is closed (or the display fails) the branch is removed and the run continues.
+    """
+    MAX_RECTS = 16                                   # NVDS_MAX_ELEMENTS_IN_DISPLAY_META
+
+    def __init__(self, max_w, max_h, max_fps, draw_boxes, sink_name, gpu_id):
         self.max_w, self.max_h = int(max_w), int(max_h)
         self.min_gap = 1.0 / max(float(max_fps), 1.0)
-        self.draw_boxes = draw_boxes
+        self.draw_boxes, self.sink_name, self.gpu_id = draw_boxes, sink_name, int(gpu_id)
         self.ok = True                  # False = preview switched off (window closed / error)
-        self.pipe = None
-        self.appsrc = None
-        self.pw = self.ph = 0
-        self.sx = self.sy = 1.0
+        self.built = False
+        self.pipeline = self.tee = self.conv = self.caps = self.osd = self.sink = None
+        self.gate_pad = None
+        self.elements = []
+        self.W0 = self.H0 = 0           # frame size the branch was built for
+        self.pw = self.ph = 0           # preview surface size
+        self.sx = self.sy = 1.0         # frame -> preview coordinate scale
         self.last = 0.0
 
     def due(self, now):
@@ -738,87 +758,145 @@ class Preview:
         self.last = now
         return True
 
-    def _start(self, W, H):
-        sc = min(self.max_w / float(W), self.max_h / float(H), 1.0)   # fit inside, never upscale
-        self.pw = max(2, (int(W * sc) // 2) * 2)
-        self.ph = max(2, (int(H * sc) // 2) * 2)
-        self.sx, self.sy = self.pw / float(W), self.ph / float(H)
+    def fit(self, W, H):
+        """Preview surface size: fit inside max_w x max_h, even numbers, never upscale."""
+        sc = min(self.max_w / float(W), self.max_h / float(H), 1.0)
+        pw = max(2, (int(W * sc) // 2) * 2)
+        ph = max(2, (int(H * sc) // 2) * 2)
+        if pw >= W and ph >= H:         # nothing to scale: force a tiny real downscale so that
+            pw = max(2, ((W - 2) // 2) * 2)   # nvvideoconvert cannot pass the shared buffer through
+            ph = max(2, ((H - 2) // 2) * 2)
+        self.pw, self.ph = pw, ph
+        self.sx, self.sy = pw / float(W), ph / float(H)
+        return pw, ph
 
-        pipe = Gst.Pipeline.new("preview")
-        src = Gst.ElementFactory.make("appsrc", "psrc")
-        conv = Gst.ElementFactory.make("videoconvert", "pconv")
-        sink = None
-        for name in ("ximagesink", "xvimagesink", "autovideosink"):
-            sink = Gst.ElementFactory.make(name, "psink")
-            if sink:
-                break
-        if not (src and conv and sink):
-            raise RuntimeError("GStreamer display elements are missing "
-                               "(Ubuntu: sudo apt install gstreamer1.0-x gstreamer1.0-plugins-base)")
-        setp(src, "caps", Gst.Caps.from_string(
-            f"video/x-raw,format=BGR,width={self.pw},height={self.ph},framerate=0/1"))
-        setp(src, "format", Gst.Format.TIME)
-        setp(src, "is-live", True)
-        setp(src, "do-timestamp", True)
-        setp(src, "block", False)
-        setp(src, "max-bytes", self.pw * self.ph * 3 * 4)
+    @staticmethod
+    def caps_string(pw, ph):
+        return f"video/x-raw(memory:NVMM), format=RGBA, width={pw}, height={ph}"
+
+    def preflight(self):
+        """Returns None if the display sink can be created and opened, else a reason string."""
+        try:
+            el = Gst.ElementFactory.make(self.sink_name, "pv_preflight")
+            if el is None:
+                return (f"GStreamer element '{self.sink_name}' was not found "
+                        f"(is DeepStream installed with display support?)")
+            ret = el.set_state(Gst.State.READY)
+            el.set_state(Gst.State.NULL)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                return f"'{self.sink_name}' could not open the display (is a desktop session / EGL available?)"
+            return None
+        except Exception as e:  # noqa: BLE001
+            return f"preview pre-check failed ({e})"
+
+    def build(self, pipeline, upstream, main_head, unified, W0, H0):
+        """Insert tee after `upstream`, keep `main_head` as the first (main) branch, add the preview branch."""
+        mk = Gst.ElementFactory.make
+        tee, q, conv = mk("tee", "pv_tee"), mk("queue", "pv_queue"), mk("nvvideoconvert", "pv_conv")
+        caps, osd, sink = mk("capsfilter", "pv_caps"), mk("nvdsosd", "pv_osd"), mk(self.sink_name, "pv_sink")
+        names = ("tee", "queue", "nvvideoconvert", "capsfilter", "nvdsosd", self.sink_name)
+        els = (tee, q, conv, caps, osd, sink)
+        missing = [n for n, e in zip(names, els) if e is None]
+        if missing:
+            print(f"[note] --preview is OFF: missing GStreamer element(s) {missing}.")
+            return False
+
+        self.W0, self.H0 = int(W0), int(H0)
+        pw, ph = self.fit(self.W0, self.H0)
+        setp(q, "max-size-buffers", 2)
+        setp(q, "max-size-bytes", 0)
+        setp(q, "max-size-time", 0)
+        setp(q, "leaky", 2)                          # drop old frames, never block the main pipeline
+        setp(conv, "nvbuf-memory-type", unified)
+        setp(conv, "gpu-id", self.gpu_id)
+        caps.set_property("caps", Gst.Caps.from_string(self.caps_string(pw, ph)))
+        setp(osd, "process-mode", 1)                 # 1 = draw on the GPU
+        setp(osd, "gpu-id", self.gpu_id)
         setp(sink, "sync", False)                    # show frames immediately
-        for el in (src, conv, sink):
-            pipe.add(el)
-        if not src.link(conv) or not conv.link(sink):
-            raise RuntimeError("could not link the preview pipeline")
-        bus = pipe.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self._on_msg)
-        if pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("could not open the preview window (is a desktop session running?)")
-        self.pipe, self.appsrc = pipe, src
-        print(f"Live preview window: {self.pw}x{self.ph} (max {self.max_w}x{self.max_h})")
-
-    def _on_msg(self, bus, msg):
-        if msg.type in (Gst.MessageType.ERROR, Gst.MessageType.EOS):
-            if msg.type == Gst.MessageType.ERROR:
-                err, _dbg = msg.parse_error()
-                print(f"[preview] window closed or display error ({err.message}); "
-                      f"the pipeline keeps running without the preview.")
-            else:
-                print("[preview] window closed; the pipeline keeps running without the preview.")
-            self.ok = False
-            GLib.idle_add(self.close)
+        setp(sink, "async", False)
+        setp(sink, "qos", False)
+        setp(sink, "window-width", pw)
+        setp(sink, "window-height", ph)
+        for el in els:
+            pipeline.add(el)
+        linked = (upstream.link(tee) and tee.link(main_head) and tee.link(q) and q.link(conv)
+                  and conv.link(caps) and caps.link(osd) and osd.link(sink))
+        if not linked:
+            print("[note] --preview is OFF: could not link the preview branch.")
+            for el in els:
+                pipeline.remove(el)                  # removing also unlinks
+            return False
+        self.pipeline, self.tee, self.conv, self.caps, self.osd, self.sink = pipeline, tee, conv, caps, osd, sink
+        self.elements = [q, conv, caps, osd, sink]
+        self.gate_pad = q.get_static_pad("sink").get_peer()      # the tee source pad of this branch
+        self.built = True
+        print(f"Live preview (DeepStream GPU branch): nvvideoconvert -> nvdsosd -> {self.sink_name}, "
+              f"{pw}x{ph} (max {self.max_w}x{self.max_h}), {1.0 / self.min_gap:.0f} fps")
         return True
 
-    def show(self, rgb, det, persons, fps):
-        """rgb: HxWx3 uint8 (blurred frame). det: Nx5 detections of the CURRENT frame."""
-        H, W = int(rgb.shape[0]), int(rgb.shape[1])
-        if self.appsrc is None:
-            self._start(W, H)
-        small = rgb if (self.pw, self.ph) == (W, H) else cv2.resize(
-            rgb, (self.pw, self.ph), interpolation=cv2.INTER_AREA)
-        img = np.ascontiguousarray(small[:, :, ::-1])                 # RGB -> BGR
-        if self.draw_boxes and len(det):
-            for x1, y1, x2, y2, _s in det:
-                cv2.rectangle(img, (int(x1 * self.sx), int(y1 * self.sy)),
-                              (int(x2 * self.sx), int(y2 * self.sy)), (0, 255, 0), 1)
-        # small overlay, top-left corner
-        bw, bh = min(130, self.pw), min(40, self.ph)
-        img[0:bh, 0:bw] = img[0:bh, 0:bw] // 3                        # darken the corner
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        #cv2.putText(img, f"Persons: {persons}", (6, 16), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(img, f"FPS: {fps:.1f}", (6, 34), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        self.appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(img.tobytes()))
+    def set_frame_size(self, W, H):
+        """Called on the first frame when the real frame size differs from the size given at build time."""
+        pw, ph = self.fit(int(W), int(H))
+        self.W0, self.H0 = int(W), int(H)
+        self.caps.set_property("caps", Gst.Caps.from_string(self.caps_string(pw, ph)))
+        setp(self.sink, "window-width", pw)
+        setp(self.sink, "window-height", ph)
+        print(f"Live preview size adjusted to the real frame size: {pw}x{ph}")
 
-    def disable(self):
-        self.ok = False
-        self.close()
+    def attach_osd(self, batch_meta, frame_meta, det, fps):
+        """Attach on-screen-display metadata (boxes + FPS text) to the frame; nvdsosd draws it on the GPU.
+        det: (N, 5) numpy array [x1, y1, x2, y2, score] in frame pixels."""
+        sx, sy = self.sx, self.sy
+        rows = det if (self.draw_boxes and len(det)) else []
+        chunks = [rows[i:i + self.MAX_RECTS] for i in range(0, len(rows), self.MAX_RECTS)] or [[]]
+        for ci, chunk in enumerate(chunks):
+            dm = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            dm.num_rects = len(chunk)
+            for i, (x1, y1, x2, y2, _s) in enumerate(chunk):
+                r = dm.rect_params[i]
+                r.left, r.top = float(x1) * sx, float(y1) * sy
+                r.width, r.height = float(x2 - x1) * sx, float(y2 - y1) * sy
+                r.border_width = 2
+                r.border_color.set(0.0, 1.0, 0.0, 1.0)
+                r.has_bg_color = 0
+            if ci == 0:
+                dm.num_labels = 1
+                t = dm.text_params[0]
+                t.display_text = f"FPS: {fps:.1f}"
+                t.x_offset, t.y_offset = 10, 10
+                t.font_params.font_name = "Serif"
+                t.font_params.font_size = 12
+                t.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
+                t.set_bg_clr = 1
+                t.text_bg_clr.set(0.0, 0.0, 0.0, 0.6)
+            pyds.nvds_add_display_meta_to_frame(frame_meta, dm)
 
-    def close(self):
+    def owns(self, el):
+        """True if a GStreamer element (or one of its parents) belongs to the preview branch."""
+        while el is not None:
+            if el in self.elements:
+                return True
+            el = el.get_parent()
+        return False
+
+    def remove_branch(self):
+        """Remove the preview branch from the running pipeline (window closed / display error).
+        The gate probe already drops every buffer, so no data is flowing into it."""
         self.ok = False
-        pipe, self.pipe = self.pipe, None
-        if pipe is not None:
+        for el in reversed(self.elements):
             try:
-                pipe.set_state(Gst.State.NULL)
+                el.set_state(Gst.State.NULL)
             except Exception:  # noqa: BLE001
                 pass
+        for el in self.elements:
+            try:
+                self.pipeline.remove(el)
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+    def close(self):
+        """Nothing to do: the branch lives inside the main pipeline and goes down with it."""
         return False
 
 
@@ -850,16 +928,19 @@ class App:
         self.out_n = 0
         self.retime_failed = False
 
-        # live preview window (optional)
+        # live preview (optional): a DeepStream branch, rendered on the GPU
         self.preview = None
         self.fps_ts = deque()            # arrival times of the last ~2 s (for the FPS shown)
         self.cur_fps = 0.0
+        self._pv_show = False            # set per frame: this frame may enter the preview branch
+        self._batch_meta = None          # batch meta of the buffer being processed (for OSD metadata)
         if a.preview:
             if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
                 print("[note] --preview needs a desktop session (no DISPLAY found). "
                       "Preview is OFF; the pipeline runs normally.")
             else:
-                self.preview = Preview(a.preview_w, a.preview_h, a.preview_fps, not a.no_preview_boxes)
+                self.preview = GpuPreview(a.preview_w, a.preview_h, a.preview_fps,
+                                          not a.no_preview_boxes, a.preview_sink, a.gpu)
 
         self.k_h, self.k_v = mod.get_function("blur_h"), mod.get_function("blur_v")
         fr = cp.zeros(64 * 256, dtype=cp.uint8)
@@ -1023,10 +1104,28 @@ class App:
         setp(sink, "sync", False)
         setp(sink, "async", False)
 
-        chain = [mux, q1, pgie, q2, conv1, caps1, q3, conv2, caps2, enc, parse, mux_out, sink]
-        for left, right in zip(chain, chain[1:]):
-            if not left.link(right):
-                sys.exit(f"Could not link {left.get_name()} -> {right.get_name()}")
+        head = [mux, q1, pgie, q2, conv1, caps1]
+        tail = [q3, conv2, caps2, enc, parse, mux_out, sink]
+        for chain in (head, tail):
+            for left, right in zip(chain, chain[1:]):
+                if not left.link(right):
+                    sys.exit(f"Could not link {left.get_name()} -> {right.get_name()}")
+
+        # caps1 -> q3 is the main path. With --preview a tee goes in between.
+        pv_ok = False
+        if self.preview is not None:
+            why = self.preview.preflight()
+            if why:
+                print(f"[note] --preview is OFF: {why}")
+                self.preview = None
+            else:
+                pv_ok = self.preview.build(self.pipeline, caps1, q3, unified, a.width, a.height)
+                if pv_ok:
+                    setp(conv1, "output-buffers", 8)     # head-room: the preview branch holds a few frames
+                else:
+                    self.preview = None
+        if not pv_ok and not caps1.link(q3):
+            sys.exit("Could not link caps1 -> q3")
 
         def on_pad_added(_el, pad):
             caps = pad.get_current_caps() or pad.query_caps(None)
@@ -1060,6 +1159,10 @@ class App:
             caps2.get_static_pad("src").add_probe(P, self.p_retime, None)   # runs before enc sink probe
         enc.get_static_pad("sink").add_probe(P, self.p_enc_in, None)
         parse.get_static_pad("src").add_probe(P, self.p_enc_out, None)
+        if pv_ok:
+            self.preview.gate_pad.add_probe(P, self.p_pv_gate, None)               # frame rate limiter
+            self.preview.conv.get_static_pad("sink").add_probe(P, self.p_pv_in, None)
+            self.preview.osd.get_static_pad("src").add_probe(P, self.p_pv_out, None)
 
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -1148,6 +1251,18 @@ class App:
                 self.encoded += 1
         return Gst.PadProbeReturn.OK
 
+    def p_pv_gate(self, pad, info, _):
+        """On the preview branch: only frames that got OSD metadata (at --preview-fps) may pass."""
+        if self._pv_show and self.preview is not None and self.preview.ok:
+            return Gst.PadProbeReturn.OK
+        return Gst.PadProbeReturn.DROP
+
+    def p_pv_in(self, pad, info, _):
+        return Gst.PadProbeReturn.OK
+
+    def p_pv_out(self, pad, info, _):
+        return Gst.PadProbeReturn.OK
+
     # -------------------------------------------------------------- main probe
     def p_main(self, pad, info, _):
         if self.failed:
@@ -1157,6 +1272,7 @@ class App:
             return Gst.PadProbeReturn.OK
         try:
             bm = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
+            self._batch_meta = bm
             node = bm.frame_meta_list
             while node is not None:
                 try:
@@ -1265,6 +1381,11 @@ class App:
                 print(f"    {n}: dims={d} elements={arr.size}")
             self.plan = self.dec.build_plan(host_outs)
             self.frame_size = (W, H)
+            if self.preview is not None and self.preview.built and (W, H) != (self.preview.W0, self.preview.H0):
+                try:
+                    self.preview.set_frame_size(W, H)
+                except Exception:  # noqa: BLE001
+                    print("[warn] could not adjust the preview size:\n" + traceback.format_exc())
             print(f"Frame size at nvinfer: {W}x{H} | RetinaFace plan OK | GPU post-processing + "
                   f"blur kernels ready\n")
             if a.max_seconds > 0:
@@ -1329,15 +1450,19 @@ class App:
             self.fps_ts.popleft()
         if len(self.fps_ts) > 1 and tn > self.fps_ts[0]:
             self.cur_fps = (len(self.fps_ts) - 1) / (tn - self.fps_ts[0])
+        self._pv_show = False
         pv = self.preview
-        if pv is not None and pv.ok and pv.due(tn):
+        if pv is not None and pv.built and pv.ok and pv.due(tn):
             try:
-                det_host = det_g[:raw].get() if raw else np.zeros((0, 5), np.float32)   # only when the preview is due
-                pv.show(cp.asnumpy(frame[:, :, :3]), det_host, raw, self.cur_fps)
+                # only the boxes (N x 5 floats) leave the GPU; the frame itself stays there
+                det_host = det_g[:raw].get() if (raw and pv.draw_boxes) else np.zeros((0, 5), np.float32)
+                pv.attach_osd(self._batch_meta, fm, det_host, self.cur_fps)
+                self._pv_show = True                        # the gate probe lets this frame into the preview branch
             except Exception:  # noqa: BLE001  (the preview must never stop the real work)
                 print("\n[warn] live preview stopped because of an error (the run continues):\n"
                       + traceback.format_exc())
-                pv.disable()
+                pv.ok = False
+                GLib.idle_add(self._drop_preview_branch)
 
         t4 = time.perf_counter()
         self.st["post"].add(t1 - t0)
@@ -1469,12 +1594,30 @@ class App:
         self.loop.quit()
         return False
 
+    def _drop_preview_branch(self):
+        """Main-loop callback: remove the preview branch after a window close / display error."""
+        if self.preview is not None:
+            self.preview.remove_branch()
+            try:
+                if not self.stopping:
+                    self.pipeline.set_state(Gst.State.PLAYING)
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
     def on_bus(self, bus, msg):
         t = msg.type
         if t == Gst.MessageType.EOS:
             self.loop.quit()
         elif t == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
+            if self.preview is not None and self.preview.built and self.preview.owns(msg.src):
+                # window closed / display problem: drop the preview, keep processing and saving
+                print(f"[preview] window closed or display error ({err.message}); "
+                      f"the pipeline keeps running without the preview.")
+                self.preview.ok = False
+                GLib.idle_add(self._drop_preview_branch)
+                return True
             print(f"\n[GStreamer ERROR] {err.message}\n{dbg}")
             self.failed = True
             self.loop.quit()
@@ -1720,6 +1863,8 @@ def parse_args():
     p.add_argument("--no-preview-boxes", action="store_true",
                    default=not bool(prev.get("draw_boxes", True)),
                    help="do not draw the green detection boxes in the preview window")
+    p.add_argument("--preview-sink", default="nveglglessink",
+                   help="DeepStream display sink for the GPU preview (nveglglessink on x86)")
     p.add_argument("--out-fps", type=float,
                    default=float(pipe.get("out_fps") if pipe.get("out_fps") is not None else 0),
                    help="fixed frame rate of the saved video (0 = automatic for HLS)")
